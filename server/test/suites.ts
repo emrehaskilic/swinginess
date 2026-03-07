@@ -1,0 +1,88 @@
+import * as TimeAndSalesTests from './TimeAndSales.test';
+import * as CvdTests from './CvdCalculator.test';
+import * as AbsorptionTests from './AbsorptionDetector.test';
+import * as OrderbookTests from './OrderbookManager.test';
+import * as OrderbookDeterminismP0Tests from './OrderbookDeterminismP0.test';
+import * as OIMonitorTests from './OpenInterestMonitor.test';
+import * as FundingTests from './FundingMonitor.test';
+import * as SessionVwapTrackerTests from './SessionVwapTracker.test';
+import * as BackfillCoordinatorTests from './BackfillCoordinator.test';
+import * as HtfStructureMonitorTests from './HtfStructureMonitor.test';
+import * as LatencyTests from './Latency.test';
+import * as SequenceRuleTests from './SequenceRule.test';
+import * as ReconnectTests from './ReconnectContinuity.test';
+import * as LegacyTests from './LegacyCalculator.test';
+import * as GateTests from './Gate.test';
+import * as FreezePolicyTests from './FreezeEmergencyPolicy.test';
+import * as ProfitLockTests from './ProfitLock.test';
+import * as OrderPlanTests from './OrderPlan.test';
+import * as DryRunEngineTests from './DryRunEngine.test';
+import * as DryRunSizingModelTests from './DryRunSizingModel.test';
+import * as DryRunSessionServiceTests from './DryRunSessionService.test';
+import * as DryRunRuntimeContextTests from './DryRunRuntimeContext.test';
+import * as StrategyDataQualityGateTests from './StrategyDataQualityGate.test';
+import * as NormalizationTests from './Normalization.test';
+import * as RegimeSelectorTests from './RegimeSelector.test';
+import * as StrategyHysteresisTests from './StrategyHysteresis.test';
+import * as HardReversalTests from './HardReversal.test';
+import * as StrategyRiskTuningTests from './StrategyRiskTuning.test';
+import * as MarketImpactSimulatorTests from './MarketImpactSimulator.test';
+import * as OrderbookIntegrityMonitorTests from './OrderbookIntegrityMonitor.test';
+// StrategyEngine removed; NEW_STRATEGY_V1.1 tests below.
+import * as DryRunClockTests from './DryRunClock.test';
+import * as FreezeControllerTests from './FreezeController.test';
+import * as PositionSizerTests from './PositionSizer.test';
+import * as ResiliencePatchesTests from './ResiliencePatches.test';
+import * as FlashCrashGuardTests from './FlashCrashGuard.test';
+import * as StrategyApiConsensusTests from './StrategyApiConsensus.test';
+import * as RiskApiRoutesTests from './RiskApiRoutes.test';
+import * as AnalyticsEngineMetricsTests from './AnalyticsEngineMetrics.test';
+import * as TelemetryApiTests from './TelemetryApi.test';
+import * as AnalyticsApiFallbackTests from './AnalyticsApiFallback.test';
+import * as SymbolEventQueueTests from './SymbolEventQueue.test';
+import * as DecisionReplayHarnessTests from './DecisionReplayHarness.test';
+
+export const testSuites: { name: string; fn: () => void | Promise<void> }[] = [
+    { name: 'TimeAndSales', fn: TimeAndSalesTests.runTests },
+    { name: 'CvdCalculator', fn: CvdTests.runTests },
+    { name: 'AbsorptionDetector', fn: AbsorptionTests.runTests },
+    { name: 'OrderbookManager', fn: OrderbookTests.runTests },
+    { name: 'OrderbookDeterminismP0', fn: OrderbookDeterminismP0Tests.runTests },
+    { name: 'OpenInterestMonitor', fn: OIMonitorTests.runTests },
+    { name: 'FundingMonitor', fn: FundingTests.runTests },
+    { name: 'SessionVwapTracker', fn: SessionVwapTrackerTests.runTests },
+    { name: 'BackfillCoordinator', fn: BackfillCoordinatorTests.runTests },
+    { name: 'HtfStructureMonitor', fn: HtfStructureMonitorTests.runTests },
+    { name: 'LatencyClamp', fn: LatencyTests.runTests },
+    { name: 'SequenceRule', fn: SequenceRuleTests.runTests },
+    { name: 'ReconnectContinuity', fn: ReconnectTests.runTests },
+    { name: 'LegacyCalculator', fn: LegacyTests.runTests },
+    { name: 'Gate', fn: GateTests.runTests },
+    { name: 'FreezeEmergencyPolicy', fn: FreezePolicyTests.runTests },
+    { name: 'ProfitLock', fn: ProfitLockTests.runTests },
+    { name: 'OrderPlan', fn: OrderPlanTests.runTests },
+    { name: 'DryRunEngine', fn: DryRunEngineTests.runTests },
+    { name: 'DryRunSizingModel', fn: DryRunSizingModelTests.runTests },
+    { name: 'DryRunSessionService', fn: DryRunSessionServiceTests.runTests },
+    { name: 'DryRunRuntimeContext', fn: DryRunRuntimeContextTests.runTests },
+    { name: 'StrategyDataQualityGate', fn: StrategyDataQualityGateTests.runTests },
+    { name: 'Normalization', fn: NormalizationTests.runTests },
+    { name: 'RegimeSelector', fn: RegimeSelectorTests.runTests },
+    { name: 'MarketImpactSimulator', fn: MarketImpactSimulatorTests.runTests },
+    { name: 'OrderbookIntegrityMonitor', fn: OrderbookIntegrityMonitorTests.runTests },
+    { name: 'StrategyHysteresis', fn: StrategyHysteresisTests.runTests },
+    { name: 'HardReversal', fn: HardReversalTests.runTests },
+    { name: 'StrategyRiskTuning', fn: StrategyRiskTuningTests.runTests },
+    { name: 'DryRunClock', fn: DryRunClockTests.runTests },
+    { name: 'FreezeController', fn: FreezeControllerTests.runTests },
+    { name: 'PositionSizer', fn: PositionSizerTests.runTests },
+    { name: 'ResiliencePatches', fn: ResiliencePatchesTests.runTests },
+    { name: 'FlashCrashGuard', fn: FlashCrashGuardTests.runTests },
+    { name: 'StrategyApiConsensus', fn: StrategyApiConsensusTests.runTests },
+    { name: 'RiskApiRoutes', fn: RiskApiRoutesTests.runTests },
+    { name: 'AnalyticsEngineMetrics', fn: AnalyticsEngineMetricsTests.runTests },
+    { name: 'TelemetryApi', fn: TelemetryApiTests.runTests },
+    { name: 'AnalyticsApiFallback', fn: AnalyticsApiFallbackTests.runTests },
+    { name: 'SymbolEventQueue', fn: SymbolEventQueueTests.runTests },
+    { name: 'DecisionReplayHarness', fn: DecisionReplayHarnessTests.runTests },
+];

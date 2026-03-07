@@ -1,0 +1,189 @@
+@import "tailwindcss";
+
+/* Custom styles for the orderflow dashboard */
+:root {
+    --safe-area-inset-bottom: env(safe-area-inset-bottom, 0px);
+    --safe-area-inset-top: env(safe-area-inset-top, 0px);
+}
+
+html,
+body {
+    margin: 0;
+    padding: 0;
+    min-height: 100vh;
+    min-height: 100dvh;
+    /* Dynamic viewport height for mobile */
+    overscroll-behavior: none;
+    -webkit-tap-highlight-color: transparent;
+}
+
+#root {
+    min-height: 100vh;
+    min-height: 100dvh;
+    padding-bottom: var(--safe-area-inset-bottom);
+}
+
+/* Custom animation classes for expand/collapse */
+@keyframes fadeIn {
+    from {
+        opacity: 0;
+    }
+
+    to {
+        opacity: 1;
+    }
+}
+
+@keyframes slideInFromTop {
+    from {
+        opacity: 0;
+        transform: translateY(-8px);
+    }
+
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+.animate-in {
+    animation: fadeIn 0.2s ease-out, slideInFromTop 0.2s ease-out;
+}
+
+.fade-in {
+    animation: fadeIn 0.2s ease-out;
+}
+
+.slide-in-from-top-2 {
+    animation: slideInFromTop 0.2s ease-out;
+}
+
+/* ===== RESPONSIVE IMPROVEMENTS ===== */
+
+/* Mobile-first base adjustments */
+@media (max-width: 640px) {
+
+    /* Smaller padding on mobile */
+    .p-6 {
+        padding: 1rem !important;
+    }
+
+    /* Smaller text on mobile */
+    .text-2xl {
+        font-size: 1.25rem !important;
+    }
+
+    /* Make dropdowns full width on mobile */
+    .relative.z-50 {
+        width: 100%;
+    }
+
+    .relative.z-50 button {
+        width: 100%;
+        justify-content: space-between;
+    }
+
+    .relative.z-50>div.absolute {
+        left: 0;
+        right: 0;
+        width: 100% !important;
+    }
+}
+
+/* Tablet adjustments */
+@media (min-width: 641px) and (max-width: 1024px) {
+    .max-w-7xl {
+        max-width: 100%;
+        padding-left: 1.5rem;
+        padding-right: 1.5rem;
+    }
+}
+
+/* Desktop improvements */
+@media (min-width: 1025px) {
+
+    /* Smooth scrolling on desktop */
+    html {
+        scroll-behavior: smooth;
+    }
+}
+
+/* ===== TOUCH-FRIENDLY IMPROVEMENTS ===== */
+@media (hover: none) and (pointer: coarse) {
+
+    /* Larger touch targets */
+    button,
+    [role="button"],
+    input[type="checkbox"] {
+        min-height: 44px;
+        min-width: 44px;
+    }
+
+    /* Remove hover effects on touch devices */
+    .hover\:bg-zinc-800:hover {
+        background-color: inherit;
+    }
+}
+
+/* ===== SCROLLBAR STYLING ===== */
+::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+}
+
+::-webkit-scrollbar-track {
+    background: rgba(39, 39, 42, 0.3);
+}
+
+::-webkit-scrollbar-thumb {
+    background: rgba(82, 82, 91, 0.6);
+    border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background: rgba(113, 113, 122, 0.8);
+}
+
+/* ===== ORDERBOOK RESPONSIVE ===== */
+.orderbook-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr 2fr;
+    align-items: center;
+    padding: 2px 4px;
+    font-size: 11px;
+}
+
+@media (max-width: 640px) {
+    .orderbook-row {
+        font-size: 10px;
+        padding: 1px 2px;
+    }
+}
+
+/* ===== METRIC CARDS RESPONSIVE ===== */
+.metric-card {
+    background: rgba(24, 24, 27, 0.6);
+    border: 1px solid rgba(63, 63, 70, 0.5);
+    border-radius: 8px;
+    padding: 12px;
+}
+
+@media (max-width: 640px) {
+    .metric-card {
+        padding: 8px;
+        border-radius: 6px;
+    }
+}
+
+/* ===== PREVENT LAYOUT SHIFT ===== */
+.font-mono {
+    font-variant-numeric: tabular-nums;
+}
+
+/* ===== SAFE AREA FOR NOTCHED DEVICES ===== */
+@supports (padding: max(0px)) {
+    .safe-area-padding {
+        padding-left: max(1rem, env(safe-area-inset-left));
+        padding-right: max(1rem, env(safe-area-inset-right));
+    }
+}
