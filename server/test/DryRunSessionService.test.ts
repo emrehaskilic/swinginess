@@ -402,6 +402,160 @@ export function runTests() {
     'peak pnl should survive mild pullbacks so strategy trailing logic can use it'
   );
 
+  const prevWinnerStopEnforceEnv = process.env.DRY_RUN_ENFORCE_WINNER_STOP;
+  const prevWinnerStopModeEnv = process.env.DRY_RUN_WINNER_STOP_MODE;
+  const prevWinnerStopGraceEnv = process.env.DRY_RUN_WINNER_STOP_GRACE_MS;
+  const prevWinnerStopConfirmEnv = process.env.DRY_RUN_WINNER_STOP_REQUIRE_STRATEGY_CONFIRM;
+  const prevWinnerStopReducePctEnv = process.env.DRY_RUN_WINNER_STOP_REDUCE_PCT;
+  process.env.DRY_RUN_ENFORCE_WINNER_STOP = 'true';
+  process.env.DRY_RUN_WINNER_STOP_MODE = 'HYBRID';
+  process.env.DRY_RUN_WINNER_STOP_GRACE_MS = '0';
+  process.env.DRY_RUN_WINNER_STOP_REQUIRE_STRATEGY_CONFIRM = 'false';
+  process.env.DRY_RUN_WINNER_STOP_REDUCE_PCT = '0.5';
+
+  const winnerProtectSvc = new DryRunSessionService();
+  winnerProtectSvc.start({
+    symbols: ['BTCUSDT'],
+    walletBalanceStartUsdt: 5000,
+    initialMarginUsdt: 500,
+    leverage: 10,
+    fundingRate: 0,
+    heartbeatIntervalMs: 1000,
+  });
+  const winnerProtectSession = (winnerProtectSvc as any).sessions.get('BTCUSDT');
+  winnerProtectSession.lastOrderBook = baseBook;
+  winnerProtectSession.latestMarkPrice = 100.8;
+  winnerProtectSession.lastState = {
+    ...winnerProtectSession.lastState,
+    walletBalance: 5000,
+    position: {
+      side: 'LONG',
+      qty: 10,
+      entryPrice: 100,
+      entryTimestampMs: 1_700_000_006_000,
+    },
+    openLimitOrders: [],
+    marginHealth: 1,
+  };
+  winnerProtectSession.winnerState = {
+    entryPrice: 100,
+    side: 'LONG',
+    rDistance: 1,
+    maxFavorablePrice: 103,
+    profitLockStop: 101,
+    trailingStop: null,
+    lockedR: 1,
+    stopBreachTicks: 3,
+  };
+  const protectiveOrders = (winnerProtectSvc as any).buildDeterministicOrders(
+    winnerProtectSession,
+    100.8,
+    1_700_000_007_000
+  );
+  assert(protectiveOrders.length === 1, 'autonomous profit lock should queue a protective order');
+  assert(protectiveOrders[0].reasonCode === 'PROFITLOCK', 'profit lock enforcement should keep the profit lock reason code');
+  assert(protectiveOrders[0].reduceOnly === true, 'profit lock enforcement must stay reduce-only');
+  assert(protectiveOrders[0].qty === 5, 'profit lock enforcement should partial-reduce by default');
+  assert(winnerProtectSession.pendingExitReason == null, 'partial profit lock reduce must not pre-label the whole trade as exited');
+
+  const winnerTrailSvc = new DryRunSessionService();
+  winnerTrailSvc.start({
+    symbols: ['BTCUSDT'],
+    walletBalanceStartUsdt: 5000,
+    initialMarginUsdt: 500,
+    leverage: 10,
+    fundingRate: 0,
+    heartbeatIntervalMs: 1000,
+  });
+  const winnerTrailSession = (winnerTrailSvc as any).sessions.get('BTCUSDT');
+  winnerTrailSession.lastOrderBook = baseBook;
+  winnerTrailSession.latestMarkPrice = 100.8;
+  winnerTrailSession.lastState = {
+    ...winnerTrailSession.lastState,
+    walletBalance: 5000,
+    position: {
+      side: 'LONG',
+      qty: 10,
+      entryPrice: 100,
+      entryTimestampMs: 1_700_000_006_000,
+    },
+    openLimitOrders: [],
+    marginHealth: 1,
+  };
+  winnerTrailSession.winnerState = {
+    entryPrice: 100,
+    side: 'LONG',
+    rDistance: 1,
+    maxFavorablePrice: 104,
+    profitLockStop: 100.4,
+    trailingStop: 100.9,
+    lockedR: 1,
+    stopBreachTicks: 3,
+  };
+  const trailOrders = (winnerTrailSvc as any).buildDeterministicOrders(
+    winnerTrailSession,
+    100.8,
+    1_700_000_008_000
+  );
+  assert(trailOrders.length === 1, 'autonomous trail stop should queue a protective order');
+  assert(trailOrders[0].reasonCode === 'TRAIL_STOP', 'trail-stop enforcement should preserve the trail-stop reason code');
+  assert(trailOrders[0].qty === 10, 'hybrid trail-stop enforcement should queue a full exit');
+  assert(winnerTrailSession.pendingExitReason === 'TRAIL_STOP', 'full trail-stop exit should set the final exit reason');
+  assert(winnerTrailSession.pendingCloseAction?.kind === 'EXIT', 'full trail-stop exit should arm the close guard');
+
+  process.env.DRY_RUN_ENFORCE_WINNER_STOP = 'false';
+
+  const winnerDeferredSvc = new DryRunSessionService();
+  winnerDeferredSvc.start({
+    symbols: ['BTCUSDT'],
+    walletBalanceStartUsdt: 5000,
+    initialMarginUsdt: 500,
+    leverage: 10,
+    fundingRate: 0,
+    heartbeatIntervalMs: 1000,
+  });
+  const winnerDeferredSession = (winnerDeferredSvc as any).sessions.get('BTCUSDT');
+  winnerDeferredSession.lastOrderBook = baseBook;
+  winnerDeferredSession.latestMarkPrice = 100.8;
+  winnerDeferredSession.lastState = {
+    ...winnerDeferredSession.lastState,
+    walletBalance: 5000,
+    position: {
+      side: 'LONG',
+      qty: 10,
+      entryPrice: 100,
+      entryTimestampMs: 1_700_000_006_000,
+    },
+    openLimitOrders: [],
+    marginHealth: 1,
+  };
+  winnerDeferredSession.winnerState = {
+    entryPrice: 100,
+    side: 'LONG',
+    rDistance: 1,
+    maxFavorablePrice: 103,
+    profitLockStop: 101,
+    trailingStop: null,
+    lockedR: 1,
+    stopBreachTicks: 3,
+  };
+  const deferredOrders = (winnerDeferredSvc as any).buildDeterministicOrders(
+    winnerDeferredSession,
+    100.8,
+    1_700_000_009_000
+  );
+  assert(deferredOrders.length === 0, 'winner-stop enforcement must stay opt-out when the feature flag is disabled');
+  assert(
+    winnerDeferredSvc.getStatus().logTail.some((l) => l.message.includes('waiting strategy decision')),
+    'disabled winner-stop enforcement should keep the advisory log-only path'
+  );
+
+  process.env.DRY_RUN_ENFORCE_WINNER_STOP = prevWinnerStopEnforceEnv;
+  process.env.DRY_RUN_WINNER_STOP_MODE = prevWinnerStopModeEnv;
+  process.env.DRY_RUN_WINNER_STOP_GRACE_MS = prevWinnerStopGraceEnv;
+  process.env.DRY_RUN_WINNER_STOP_REQUIRE_STRATEGY_CONFIRM = prevWinnerStopConfirmEnv;
+  process.env.DRY_RUN_WINNER_STOP_REDUCE_PCT = prevWinnerStopReducePctEnv;
+
   const prevStructureEnv = process.env.STRUCTURE_ENGINE_ENABLED;
   process.env.STRUCTURE_ENGINE_ENABLED = 'true';
 
@@ -573,6 +727,9 @@ export function runTests() {
   autonomousPathSvc.stop();
   reduceCooldownSvc.stop();
   peakTrackingSvc.stop();
+  winnerProtectSvc.stop();
+  winnerTrailSvc.stop();
+  winnerDeferredSvc.stop();
   structureSvc.stop();
   blockedStructureSvc.stop();
   const stopped = svc.stop();

@@ -7,7 +7,7 @@ import { SessionStore } from './SessionStore';
 import { LimitOrderStrategy, LimitStrategyMode } from './LimitOrderStrategy';
 import { DryRunLogEvent, DryRunOrderflowMetrics, DryRunTradeLogger } from './DryRunTradeLogger';
 import { FlipGovernor } from './FlipGovernor';
-import { WinnerManager, WinnerState } from './WinnerManager';
+import { WinnerDecision, WinnerManager, WinnerState } from './WinnerManager';
 import { AddOnManager } from './AddOnManager';
 import { DryRunClock } from './DryRunClock';
 import { MaterializedSymbolCapitalConfig, SymbolCapitalConfig, materializeSymbolCapitalConfigs, normalizeSymbolCapitalConfigs } from '../types/capital';
@@ -239,6 +239,7 @@ type AddOnState = {
 };
 
 type WorkingOrderLogState = Map<string, string>;
+type WinnerStopExecutionMode = 'REDUCE' | 'EXIT' | 'HYBRID';
 
 type SymbolSession = {
   symbol: string;
@@ -316,6 +317,9 @@ type SymbolSession = {
   peakUnrealizedPnlPct: number;
   lastSnapshotLogTs: number;
   lastWinnerSignalLogTs: number;
+  winnerStopAction: WinnerDecision['action'];
+  winnerStopActionStartedAtMs: number;
+  winnerStopPartialReduceAtMs: number;
   aiEntryCancelStreak: number;
   aiEntryCooldownUntilMs: number;
   lastAiEntryCooldownLogTs: number;
@@ -456,6 +460,42 @@ function parseLimitStrategy(input: string): LimitStrategyMode {
 function finiteOr(value: unknown, fallback: number): number {
   const n = Number(value);
   return Number.isFinite(n) ? n : fallback;
+}
+
+function parseBooleanEnv(value: unknown, fallback: boolean): boolean {
+  const normalized = String(value ?? '').trim().toLowerCase();
+  if (!normalized) return fallback;
+  if (['1', 'true', 'yes', 'on'].includes(normalized)) return true;
+  if (['0', 'false', 'no', 'off'].includes(normalized)) return false;
+  return fallback;
+}
+
+function normalizeWinnerStopMode(value: unknown): WinnerStopExecutionMode {
+  const normalized = String(value ?? '').trim().toUpperCase();
+  if (normalized === 'REDUCE' || normalized === 'EXIT' || normalized === 'HYBRID') {
+    return normalized;
+  }
+  return 'HYBRID';
+}
+
+function readWinnerStopEnforced(): boolean {
+  return parseBooleanEnv(process.env.DRY_RUN_ENFORCE_WINNER_STOP, true);
+}
+
+function readWinnerStopMode(): WinnerStopExecutionMode {
+  return normalizeWinnerStopMode(process.env.DRY_RUN_WINNER_STOP_MODE);
+}
+
+function readWinnerStopRequireStrategyConfirm(): boolean {
+  return parseBooleanEnv(process.env.DRY_RUN_WINNER_STOP_REQUIRE_STRATEGY_CONFIRM, false);
+}
+
+function readWinnerStopGraceMs(): number {
+  return Math.max(0, Math.trunc(clampNumber(process.env.DRY_RUN_WINNER_STOP_GRACE_MS, 0, 0, 120_000)));
+}
+
+function readWinnerStopReducePct(): number {
+  return clampNumber(process.env.DRY_RUN_WINNER_STOP_REDUCE_PCT, 0.5, 0.1, 1);
 }
 
 function clampNumber(value: unknown, fallback: number, min: number, max: number): number {
@@ -736,6 +776,9 @@ export class DryRunSessionService {
         peakUnrealizedPnlPct: 0,
         lastSnapshotLogTs: 0,
         lastWinnerSignalLogTs: 0,
+        winnerStopAction: null,
+        winnerStopActionStartedAtMs: 0,
+        winnerStopPartialReduceAtMs: 0,
         aiEntryCancelStreak: 0,
         aiEntryCooldownUntilMs: 0,
         lastAiEntryCooldownLogTs: 0,
@@ -930,6 +973,9 @@ export class DryRunSessionService {
         peakUnrealizedPnlPct: Number(sessionSnapshot?.peakUnrealizedPnlPct || 0),
         lastSnapshotLogTs: 0,
         lastWinnerSignalLogTs: 0,
+        winnerStopAction: null,
+        winnerStopActionStartedAtMs: 0,
+        winnerStopPartialReduceAtMs: 0,
         aiEntryCancelStreak: 0,
         aiEntryCooldownUntilMs: 0,
         lastAiEntryCooldownLogTs: 0,
@@ -2085,6 +2131,10 @@ export class DryRunSessionService {
     session.winnerState = winnerDecision.nextState;
     session.stopLossPrice = this.resolveActiveStop(session.winnerState);
 
+    if (!winnerDecision.action) {
+      this.resetWinnerStopExecutionState(session);
+    }
+
     if (winnerDecision.action && position.qty > 0) {
       if (!this.isAIAutonomousRun()) {
         const closeSide: 'BUY' | 'SELL' = position.side === 'LONG' ? 'SELL' : 'BUY';
@@ -2100,17 +2150,8 @@ export class DryRunSessionService {
         return orders;
       }
 
-      if (
-        session.lastWinnerSignalLogTs === 0
-        || (eventTimestampMs - session.lastWinnerSignalLogTs) >= this.config.heartbeatIntervalMs
-      ) {
-        this.addConsoleLog(
-          'INFO',
-          session.symbol,
-          `Winner stop armed (${winnerDecision.action}) at ${roundTo(winnerDecision.stopPrice ?? markPrice, 4)}; waiting strategy decision.`,
-          eventTimestampMs
-        );
-        session.lastWinnerSignalLogTs = eventTimestampMs;
+      if (this.maybeEnforceAutonomousWinnerStop(session, position, winnerDecision, markPrice, eventTimestampMs, orders)) {
+        return orders;
       }
     }
 
@@ -2677,6 +2718,164 @@ export class DryRunSessionService {
       postOnly: false,
       reasonCode,
     };
+  }
+
+  private resetWinnerStopExecutionState(session: SymbolSession): void {
+    session.winnerStopAction = null;
+    session.winnerStopActionStartedAtMs = 0;
+    session.winnerStopPartialReduceAtMs = 0;
+  }
+
+  private shouldForceFullExitForWinnerStop(action: WinnerDecision['action']): boolean {
+    const mode = readWinnerStopMode();
+    if (mode === 'EXIT') return true;
+    if (mode === 'REDUCE') return false;
+    return action === 'TRAIL_STOP';
+  }
+
+  private resolveWinnerStopReduceQty(fullQty: number, referencePrice: number): { qty: number; fullClose: boolean } {
+    const normalizedQty = roundTo(Math.max(0, fullQty), 6);
+    if (!(normalizedQty > 0)) return { qty: 0, fullClose: true };
+
+    let reduceQty = roundTo(normalizedQty * readWinnerStopReducePct(), 6);
+    const residualQty = roundTo(Math.max(0, normalizedQty - Math.max(0, reduceQty)), 6);
+    const reduceNotional = Math.max(0, reduceQty * Math.max(referencePrice, 0));
+    const residualNotional = Math.max(0, residualQty * Math.max(referencePrice, 0));
+    const forceFullClose =
+      !(reduceQty > 0)
+      || reduceQty >= normalizedQty
+      || residualQty <= DEFAULT_DUST_MIN_QTY
+      || (residualNotional > 0 && residualNotional <= DEFAULT_DUST_MIN_NOTIONAL_USDT)
+      || (reduceNotional > 0 && reduceNotional < DEFAULT_MIN_REDUCE_NOTIONAL_USDT);
+
+    if (forceFullClose) {
+      reduceQty = normalizedQty;
+    }
+
+    return {
+      qty: reduceQty,
+      fullClose: forceFullClose,
+    };
+  }
+
+  private maybeLogWinnerStopState(session: SymbolSession, eventTimestampMs: number, message: string): void {
+    const heartbeatIntervalMs = this.config?.heartbeatIntervalMs ?? DEFAULT_HEARTBEAT_INTERVAL_MS;
+    if (
+      session.lastWinnerSignalLogTs !== 0
+      && (eventTimestampMs - session.lastWinnerSignalLogTs) < heartbeatIntervalMs
+    ) {
+      return;
+    }
+    this.addConsoleLog('INFO', session.symbol, message, eventTimestampMs);
+    session.lastWinnerSignalLogTs = eventTimestampMs;
+  }
+
+  private maybeEnforceAutonomousWinnerStop(
+    session: SymbolSession,
+    position: NonNullable<DryRunStateSnapshot['position']>,
+    winnerDecision: WinnerDecision,
+    markPrice: number,
+    eventTimestampMs: number,
+    orders: DryRunOrderRequest[],
+  ): boolean {
+    const action = winnerDecision.action;
+    if (!action) return false;
+
+    if (session.winnerStopAction !== action) {
+      session.winnerStopAction = action;
+      session.winnerStopActionStartedAtMs = eventTimestampMs;
+      session.winnerStopPartialReduceAtMs = 0;
+    }
+
+    const stopPrice = roundTo(winnerDecision.stopPrice ?? markPrice, 4);
+    const details = `stop=${stopPrice} mark=${roundTo(markPrice, 4)} r=${roundTo(winnerDecision.rMultiple, 2)} peak=${(Math.max(0, session.peakUnrealizedPnlPct) * 100).toFixed(2)}%`;
+    if (!readWinnerStopEnforced() || readWinnerStopRequireStrategyConfirm()) {
+      this.maybeLogWinnerStopState(
+        session,
+        eventTimestampMs,
+        `Winner stop armed (${action}) ${details}; waiting strategy decision.`
+      );
+      return false;
+    }
+
+    const winnerStopGraceMs = readWinnerStopGraceMs();
+    const armAgeMs = Math.max(0, eventTimestampMs - session.winnerStopActionStartedAtMs);
+    if (winnerStopGraceMs > 0 && armAgeMs < winnerStopGraceMs) {
+      this.maybeLogWinnerStopState(
+        session,
+        eventTimestampMs,
+        `Winner stop armed (${action}) ${details}; grace ${winnerStopGraceMs - armAgeMs}ms before enforcement.`
+      );
+      return false;
+    }
+
+    const forceFullExit = this.shouldForceFullExitForWinnerStop(action);
+    if (
+      !forceFullExit
+      && session.winnerStopPartialReduceAtMs > 0
+      && session.winnerStopActionStartedAtMs > 0
+      && session.winnerStopPartialReduceAtMs >= session.winnerStopActionStartedAtMs
+    ) {
+      return false;
+    }
+
+    if (this.hasPendingCloseAction(session, position.side, eventTimestampMs)) {
+      return false;
+    }
+    if (this.hasLiveReduceOnlyOrderForPosition(session, position.side)) {
+      return false;
+    }
+
+    if (
+      forceFullExit
+      && DEFAULT_STRAT_EXIT_MIN_INTERVAL_MS > 0
+      && session.lastExitOrderTs > 0
+      && (eventTimestampMs - session.lastExitOrderTs) < DEFAULT_STRAT_EXIT_MIN_INTERVAL_MS
+    ) {
+      return false;
+    }
+    if (
+      !forceFullExit
+      && DEFAULT_STRAT_REDUCE_MIN_INTERVAL_MS > 0
+      && session.lastReduceOrderTs > 0
+      && (eventTimestampMs - session.lastReduceOrderTs) < DEFAULT_STRAT_REDUCE_MIN_INTERVAL_MS
+    ) {
+      return false;
+    }
+
+    const closeSide: 'BUY' | 'SELL' = position.side === 'LONG' ? 'SELL' : 'BUY';
+    const referencePrice = Math.max(0, markPrice || session.latestMarkPrice || position.entryPrice);
+    const sizing = forceFullExit
+      ? { qty: roundTo(position.qty, 6), fullClose: true }
+      : this.resolveWinnerStopReduceQty(position.qty, referencePrice);
+    if (!(sizing.qty > 0)) {
+      return false;
+    }
+
+    const reasonCode: DryRunReasonCode = action === 'TRAIL_STOP' ? 'TRAIL_STOP' : 'PROFITLOCK';
+    const order = this.buildAiLimitOrder(session, closeSide, sizing.qty, true, reasonCode);
+    if (!order) {
+      return false;
+    }
+
+    orders.push(order);
+    session.lastExitOrderTs = eventTimestampMs;
+    if (!forceFullExit || !sizing.fullClose) {
+      session.lastReduceOrderTs = eventTimestampMs;
+    }
+    if (sizing.fullClose) {
+      session.pendingExitReason = action === 'TRAIL_STOP' ? 'TRAIL_STOP' : 'PROFITLOCK_STOP';
+      this.armPendingCloseAction(session, 'EXIT', position.side, eventTimestampMs);
+    } else {
+      session.winnerStopPartialReduceAtMs = eventTimestampMs;
+    }
+
+    this.maybeLogWinnerStopState(
+      session,
+      eventTimestampMs,
+      `Winner stop enforced (${action}) queued ${sizing.fullClose ? 'full exit' : `protective reduce ${roundTo(sizing.qty, 6)}`} ${position.side}; ${details}.`
+    );
+    return true;
   }
 
   private buildAiPostOnlyEntryOrder(
@@ -3794,6 +3993,7 @@ export class DryRunSessionService {
     if (!prevPosition && nextPosition) {
       this.clearPendingCloseAction(session);
       this.resetAiEntryBackoff(session);
+      this.resetWinnerStopExecutionState(session);
       session.winnerState = this.winnerManager.initState({
         entryPrice: nextPosition.entryPrice,
         side: nextPosition.side,
@@ -3822,6 +4022,7 @@ export class DryRunSessionService {
     if (prevPosition && !nextPosition) {
       this.clearPendingCloseAction(session, prevPosition.side);
       this.resetAiEntryBackoff(session);
+      this.resetWinnerStopExecutionState(session);
       session.winnerState = null;
       session.stopLossPrice = null;
       session.addOnState.pendingClientOrderId = null;
@@ -3841,6 +4042,7 @@ export class DryRunSessionService {
     if (prevPosition && nextPosition && prevPosition.side !== nextPosition.side) {
       this.clearPendingCloseAction(session, prevPosition.side);
       this.resetAiEntryBackoff(session);
+      this.resetWinnerStopExecutionState(session);
       session.winnerState = this.winnerManager.initState({
         entryPrice: nextPosition.entryPrice,
         side: nextPosition.side,
