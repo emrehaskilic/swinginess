@@ -215,4 +215,67 @@ export function runTests() {
     !blockedByContext.actions.some((action) => action.type === 'ENTRY'),
     'blocked execution context should veto otherwise valid entries',
   );
+
+  const adaptiveStrategy = new NewStrategyV11({
+    mhtTRs: 0,
+    mhtMRs: 0,
+    mhtEVs: 0,
+    cooldownSameS: 0,
+    cooldownFlipS: 0,
+  });
+  warm(adaptiveStrategy, 3_000_000);
+
+  const adaptiveAllowed = adaptiveStrategy.evaluate(makeInput(3_030_000, {
+    decisionContext: makeContext({
+      manipulation: {
+        risk: 'MEDIUM',
+        spoofScore: 9,
+        vpinApprox: 0.72,
+        burstPersistenceScore: 0.32,
+        blocked: false,
+        reasons: ['SPOOF_SCORE_ELEVATED'],
+      },
+      adaptive: {
+        ready: true,
+        sampleCount: 180,
+        spoofScoreThreshold: 12,
+        vpinThreshold: 0.78,
+        expectedSlippageBpsThreshold: 6,
+        spoofScorePercentile: 0.74,
+        vpinPercentile: 0.7,
+        expectedSlippageBpsPercentile: 0.5,
+      },
+    }),
+  }));
+  assert(
+    adaptiveAllowed.actions.some((action) => action.type === 'ENTRY' && action.side === 'LONG'),
+    'adaptive pair thresholds should allow entries that are noisy but normal for that symbol',
+  );
+
+  const adaptiveBlocked = adaptiveStrategy.evaluate(makeInput(3_040_000, {
+    decisionContext: makeContext({
+      manipulation: {
+        risk: 'HIGH',
+        spoofScore: 15,
+        vpinApprox: 0.84,
+        burstPersistenceScore: 0.4,
+        blocked: true,
+        reasons: ['SPOOF_SCORE_HIGH', 'TOXIC_FLOW_HIGH'],
+      },
+      adaptive: {
+        ready: true,
+        sampleCount: 180,
+        spoofScoreThreshold: 12,
+        vpinThreshold: 0.78,
+        expectedSlippageBpsThreshold: 6,
+        spoofScorePercentile: 0.99,
+        vpinPercentile: 0.98,
+        expectedSlippageBpsPercentile: 0.5,
+      },
+    }),
+  }));
+  assert(
+    !adaptiveBlocked.actions.some((action) => action.type === 'ENTRY'),
+    'adaptive pair thresholds should still block true local extremes',
+  );
 }

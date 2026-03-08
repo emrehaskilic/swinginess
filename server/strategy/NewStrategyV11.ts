@@ -431,10 +431,19 @@ export class NewStrategyV11 {
     if (!this.config.contextEntryVetoEnabled) return false;
     const context = this.getDecisionContext(input);
     if (!context) return false;
+    const spoofThreshold = context.adaptive?.ready
+      ? context.adaptive.spoofScoreThreshold
+      : this.config.maxSpoofScoreForEntry;
+    const vpinThreshold = context.adaptive?.ready
+      ? context.adaptive.vpinThreshold
+      : this.config.maxVpinForEntry;
+    const slippageThreshold = context.adaptive?.ready
+      ? context.adaptive.expectedSlippageBpsThreshold
+      : this.config.maxExpectedSlippageBpsForEntry;
     if (context.execution.quality === 'BLOCKED') return true;
-    if (context.manipulation.spoofScore > this.config.maxSpoofScoreForEntry) return true;
-    if (context.manipulation.vpinApprox > this.config.maxVpinForEntry) return true;
-    if (context.liquidity.expectedSlippageBps > this.config.maxExpectedSlippageBpsForEntry) return true;
+    if (context.manipulation.spoofScore > spoofThreshold) return true;
+    if (context.manipulation.vpinApprox > vpinThreshold) return true;
+    if (context.liquidity.expectedSlippageBps > slippageThreshold) return true;
     return false;
   }
 

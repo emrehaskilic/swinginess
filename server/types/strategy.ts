@@ -194,6 +194,17 @@ export interface ExecutionDecisionContext {
   confidence: number;
 }
 
+export interface AdaptiveThresholdDecisionContext {
+  ready: boolean;
+  sampleCount: number;
+  spoofScoreThreshold: number;
+  vpinThreshold: number;
+  expectedSlippageBpsThreshold: number;
+  spoofScorePercentile: number | null;
+  vpinPercentile: number | null;
+  expectedSlippageBpsPercentile: number | null;
+}
+
 export interface StrategyDecisionContext {
   updatedAtMs: number;
   trend: TrendDecisionContext;
@@ -202,6 +213,7 @@ export interface StrategyDecisionContext {
   auction: AuctionDecisionContext;
   edge: EdgeDecisionContext;
   execution: ExecutionDecisionContext;
+  adaptive?: AdaptiveThresholdDecisionContext | null;
   preferredSetup: EntrySetupKind | null;
 }
 

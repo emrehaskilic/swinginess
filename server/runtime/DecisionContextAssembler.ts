@@ -1,5 +1,6 @@
 import type { AdvancedMicrostructureBundle } from '../metrics/AdvancedMicrostructureMetrics';
 import type {
+  AdaptiveThresholdDecisionContext,
   AuctionAcceptance,
   AuctionLocation,
   EntrySetupKind,
@@ -11,8 +12,23 @@ import type {
   StrategyTrendState,
 } from '../types/strategy';
 import type { StructureSnapshot } from '../structure/types';
+import type { PairAdaptiveThresholdSnapshot } from './PairThresholdCalibrator';
 
 const clamp = (value: number, min: number, max: number): number => Math.max(min, Math.min(max, value));
+
+function resolveAdaptiveThresholds(adaptive: PairAdaptiveThresholdSnapshot | null | undefined): AdaptiveThresholdDecisionContext | null {
+  if (!adaptive) return null;
+  return {
+    ready: adaptive.ready,
+    sampleCount: adaptive.sampleCount,
+    spoofScoreThreshold: adaptive.spoofScoreThreshold,
+    vpinThreshold: adaptive.vpinThreshold,
+    expectedSlippageBpsThreshold: adaptive.expectedSlippageBpsThreshold,
+    spoofScorePercentile: adaptive.spoofScorePercentile,
+    vpinPercentile: adaptive.vpinPercentile,
+    expectedSlippageBpsPercentile: adaptive.expectedSlippageBpsPercentile,
+  };
+}
 
 function resolveLiquidityQuality(input: {
   orderbookTrusted: boolean;
@@ -21,10 +37,20 @@ function resolveLiquidityQuality(input: {
   expectedSlippageBps: number;
   voidGapScore: number;
   vpinApprox: number;
+  adaptive: AdaptiveThresholdDecisionContext | null;
 }): LiquidityQuality {
   if (!input.orderbookTrusted || (input.integrityLevel && input.integrityLevel === 'CRITICAL')) return 'BLOCKED';
-  if (input.expectedSlippageBps >= 12 || input.voidGapScore >= 0.75 || input.vpinApprox >= 0.8) return 'TOXIC';
-  if (input.expectedSlippageBps >= 6 || (input.spreadPct ?? 0) >= 0.08 || input.voidGapScore >= 0.45) return 'THIN';
+  const toxicSlippage = input.adaptive?.ready
+    ? Math.max(2, input.adaptive.expectedSlippageBpsThreshold * 1.1)
+    : 12;
+  const thinSlippage = input.adaptive?.ready
+    ? Math.max(1, input.adaptive.expectedSlippageBpsThreshold * 0.7)
+    : 6;
+  const toxicVpin = input.adaptive?.ready
+    ? clamp(input.adaptive.vpinThreshold + 0.05, 0.55, 0.99)
+    : 0.8;
+  if (input.expectedSlippageBps >= toxicSlippage || input.voidGapScore >= 0.75 || input.vpinApprox >= toxicVpin) return 'TOXIC';
+  if (input.expectedSlippageBps >= thinSlippage || (input.spreadPct ?? 0) >= 0.08 || input.voidGapScore >= 0.45) return 'THIN';
   return 'GOOD';
 }
 
@@ -32,9 +58,14 @@ function resolveManipulationRisk(input: {
   spoofScore: number;
   vpinApprox: number;
   burstPersistenceScore: number;
+  adaptive: AdaptiveThresholdDecisionContext | null;
 }): ManipulationRiskLevel {
-  if (input.spoofScore >= 2 || input.vpinApprox >= 0.8 || input.burstPersistenceScore >= 0.8) return 'HIGH';
-  if (input.spoofScore >= 1 || input.vpinApprox >= 0.6 || input.burstPersistenceScore >= 0.55) return 'MEDIUM';
+  const highSpoof = input.adaptive?.ready ? input.adaptive.spoofScoreThreshold : 2;
+  const mediumSpoof = input.adaptive?.ready ? Math.max(0.5, highSpoof * 0.7) : 1;
+  const highVpin = input.adaptive?.ready ? input.adaptive.vpinThreshold : 0.8;
+  const mediumVpin = input.adaptive?.ready ? clamp(highVpin * 0.85, 0.45, 0.95) : 0.6;
+  if (input.spoofScore >= highSpoof || input.vpinApprox >= highVpin || input.burstPersistenceScore >= 0.8) return 'HIGH';
+  if (input.spoofScore >= mediumSpoof || input.vpinApprox >= mediumVpin || input.burstPersistenceScore >= 0.55) return 'MEDIUM';
   return 'LOW';
 }
 
@@ -42,12 +73,17 @@ function resolveManipulationReasons(input: {
   spoofScore: number;
   vpinApprox: number;
   burstPersistenceScore: number;
+  adaptive: AdaptiveThresholdDecisionContext | null;
 }): string[] {
   const reasons: string[] = [];
-  if (input.spoofScore >= 2) reasons.push('SPOOF_SCORE_HIGH');
-  else if (input.spoofScore >= 1) reasons.push('SPOOF_SCORE_ELEVATED');
-  if (input.vpinApprox >= 0.8) reasons.push('TOXIC_FLOW_HIGH');
-  else if (input.vpinApprox >= 0.6) reasons.push('TOXIC_FLOW_ELEVATED');
+  const highSpoof = input.adaptive?.ready ? input.adaptive.spoofScoreThreshold : 2;
+  const mediumSpoof = input.adaptive?.ready ? Math.max(0.5, highSpoof * 0.7) : 1;
+  const highVpin = input.adaptive?.ready ? input.adaptive.vpinThreshold : 0.8;
+  const mediumVpin = input.adaptive?.ready ? clamp(highVpin * 0.85, 0.45, 0.95) : 0.6;
+  if (input.spoofScore >= highSpoof) reasons.push('SPOOF_SCORE_HIGH');
+  else if (input.spoofScore >= mediumSpoof) reasons.push('SPOOF_SCORE_ELEVATED');
+  if (input.vpinApprox >= highVpin) reasons.push('TOXIC_FLOW_HIGH');
+  else if (input.vpinApprox >= mediumVpin) reasons.push('TOXIC_FLOW_ELEVATED');
   if (input.burstPersistenceScore >= 0.8) reasons.push('BURST_PERSISTENCE_HIGH');
   else if (input.burstPersistenceScore >= 0.55) reasons.push('BURST_PERSISTENCE_ELEVATED');
   return reasons;
@@ -115,16 +151,18 @@ export function assembleDecisionContext(input: {
   profile: SessionProfileSnapshot | null;
   advancedBundle: AdvancedMicrostructureBundle;
   structure: StructureSnapshot | null;
+  adaptiveThresholds?: PairAdaptiveThresholdSnapshot | null;
 }): StrategyDecisionContext {
   const price = Number(input.price || 0);
   const spreadPct = Number(input.spreadPct ?? 0);
-  const effectiveSpreadAbs = Math.max(0, Number(input.advancedBundle.liquidityMetrics.effectiveSpread || 0));
-  const expectedSlippageAbs = Math.max(
+  const adaptive = resolveAdaptiveThresholds(input.adaptiveThresholds);
+  const effectiveSpreadPct = Math.max(0, Number(input.advancedBundle.liquidityMetrics.effectiveSpread || 0));
+  const expectedSlippagePct = Math.max(
     Number(input.advancedBundle.liquidityMetrics.expectedSlippageBuy || 0),
     Number(input.advancedBundle.liquidityMetrics.expectedSlippageSell || 0),
   );
-  const expectedSlippageBps = price > 0 ? (expectedSlippageAbs / price) * 10_000 : 0;
-  const effectiveSpreadBps = price > 0 ? (effectiveSpreadAbs / price) * 10_000 : spreadPct * 100;
+  const expectedSlippageBps = Math.max(0, expectedSlippagePct) * 100;
+  const effectiveSpreadBps = Math.max(0, effectiveSpreadPct) * 100;
   const voidGapScore = clamp(Number(input.advancedBundle.liquidityMetrics.voidGapScore || 0), 0, 1);
   const wallScore = clamp(Number(input.advancedBundle.liquidityMetrics.liquidityWallScore || 0), 0, 1);
   const spoofScore = Math.max(0, Number(input.advancedBundle.passiveFlowMetrics.spoofScore || 0));
@@ -137,9 +175,10 @@ export function assembleDecisionContext(input: {
     expectedSlippageBps,
     voidGapScore,
     vpinApprox,
+    adaptive,
   });
-  const manipulationRisk = resolveManipulationRisk({ spoofScore, vpinApprox, burstPersistenceScore });
-  const manipulationReasons = resolveManipulationReasons({ spoofScore, vpinApprox, burstPersistenceScore });
+  const manipulationRisk = resolveManipulationRisk({ spoofScore, vpinApprox, burstPersistenceScore, adaptive });
+  const manipulationReasons = resolveManipulationReasons({ spoofScore, vpinApprox, burstPersistenceScore, adaptive });
 
   const spreadCostPct = Math.max(0, spreadPct) / 100;
   const volatilityPct = price > 0 ? Math.max(0, Number(input.advancedBundle.regimeMetrics.microATR || 0)) / price : 0;
@@ -227,6 +266,7 @@ export function assembleDecisionContext(input: {
         1,
       ),
     },
+    adaptive,
     preferredSetup,
   };
 }

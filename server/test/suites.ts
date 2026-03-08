@@ -24,6 +24,7 @@ import * as DryRunSizingModelTests from './DryRunSizingModel.test';
 import * as DryRunSessionServiceTests from './DryRunSessionService.test';
 import * as DryRunRuntimeContextTests from './DryRunRuntimeContext.test';
 import * as DecisionContextAssemblerTests from './DecisionContextAssembler.test';
+import * as PairThresholdCalibratorTests from './PairThresholdCalibrator.test';
 import * as PositionLifecycleManagerTests from './PositionLifecycleManager.test';
 import * as StrategyDataQualityGateTests from './StrategyDataQualityGate.test';
 import * as NormalizationTests from './Normalization.test';
@@ -76,6 +77,7 @@ export const testSuites: { name: string; fn: () => void | Promise<void> }[] = [
     { name: 'DryRunSessionService', fn: DryRunSessionServiceTests.runTests },
     { name: 'DryRunRuntimeContext', fn: DryRunRuntimeContextTests.runTests },
     { name: 'DecisionContextAssembler', fn: DecisionContextAssemblerTests.runTests },
+    { name: 'PairThresholdCalibrator', fn: PairThresholdCalibratorTests.runTests },
     { name: 'PositionLifecycleManager', fn: PositionLifecycleManagerTests.runTests },
     { name: 'StrategyDataQualityGate', fn: StrategyDataQualityGateTests.runTests },
     { name: 'Normalization', fn: NormalizationTests.runTests },

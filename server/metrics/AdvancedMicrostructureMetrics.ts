@@ -261,7 +261,7 @@ export class AdvancedMicrostructureMetrics {
   private spotMidPrice: number | null = null;
   private spotImbalance10: number | null = null;
 
-  private readonly baseQty = Math.max(0.001, Number(process.env.MICRO_BASE_QTY || 10));
+  private readonly baseNotional = Math.max(50, Number(process.env.MICRO_BASE_NOTIONAL_USDT || 1000));
   private readonly spoofWindowMs = Math.max(250, Number(process.env.SPOOF_WINDOW_MS || 2000));
   private readonly spoofHalfLifeMs = Math.max(500, Number(process.env.SPOOF_HALF_LIFE_MS || 5000));
   private readonly refreshWindowMs = Math.max(200, Number(process.env.REFRESH_WINDOW_MS || 1000));
@@ -547,8 +547,8 @@ export class AdvancedMicrostructureMetrics {
       bookConvexity: this.computeBookConvexity(bids, asks),
       liquidityWallScore: this.computeLiquidityWallScore(bids, asks),
       voidGapScore: this.computeVoidGapScore(bids, asks, mid),
-      expectedSlippageBuy: this.simulateSlippage(asks, this.baseQty, bestAsk, 'buy'),
-      expectedSlippageSell: this.simulateSlippage(bids, this.baseQty, bestBid, 'sell'),
+      expectedSlippageBuy: this.simulateSlippage(asks, this.baseNotional, bestAsk, 'buy'),
+      expectedSlippageSell: this.simulateSlippage(bids, this.baseNotional, bestBid, 'sell'),
       resiliencyMs: this.resiliencyStats.mean(ts),
       effectiveSpread: this.effectiveSpreadStats.mean(ts),
       realizedSpreadShortWindow: this.realizedSpreadStats.mean(ts),
@@ -1002,23 +1002,26 @@ export class AdvancedMicrostructureMetrics {
     return Math.max(0, (maxGap / med) - 1);
   }
 
-  private simulateSlippage(levels: [number, number, number][], baseQty: number, referencePrice: number, side: TradeSide): number {
-    if (!(referencePrice > 0) || baseQty <= 0 || levels.length === 0) return 0;
-    let remaining = baseQty;
+  private simulateSlippage(levels: [number, number, number][], targetNotional: number, referencePrice: number, side: TradeSide): number {
+    if (!(referencePrice > 0) || targetNotional <= 0 || levels.length === 0) return 0;
+    let remainingNotional = targetNotional;
     let filledQty = 0;
     let totalNotional = 0;
     for (const [price, qty] of levels) {
-      if (remaining <= EPS) break;
-      const take = Math.min(remaining, qty);
+      if (remainingNotional <= EPS) break;
+      const availableNotional = price * qty;
+      const takeNotional = Math.min(remainingNotional, availableNotional);
+      const take = takeNotional / Math.max(price, EPS);
       filledQty += take;
       totalNotional += take * price;
-      remaining -= take;
+      remainingNotional -= takeNotional;
     }
-    if (remaining > EPS) {
+    if (remainingNotional > EPS) {
       const lastPrice = levels[levels.length - 1][0];
       const synthetic = side === 'buy' ? lastPrice * 1.0005 : lastPrice * 0.9995;
-      totalNotional += remaining * synthetic;
-      filledQty += remaining;
+      const syntheticQty = remainingNotional / Math.max(synthetic, EPS);
+      totalNotional += syntheticQty * synthetic;
+      filledQty += syntheticQty;
     }
     if (filledQty <= EPS) return 0;
     const avgPrice = totalNotional / filledQty;

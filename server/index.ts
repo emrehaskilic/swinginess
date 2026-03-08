@@ -82,6 +82,7 @@ import { SessionProfileTracker } from './metrics/SessionProfileTracker';
 import { CryptoStructureEngine } from './structure/CryptoStructureEngine';
 import { deriveDryRunRuntimeContext } from './runtime/DryRunRuntimeContext';
 import { assembleDecisionContext } from './runtime/DecisionContextAssembler';
+import { PairThresholdCalibrator } from './runtime/PairThresholdCalibrator';
 import { deriveBias15m, deriveVeto1h } from './strategy/HtfBias';
 import { SymbolCapitalConfig, materializeSymbolCapitalConfigs, normalizeSymbolCapitalConfigs } from './types/capital';
 import { AnalyticsEngine } from './analytics';
@@ -459,6 +460,7 @@ const absorptionResult = new Map<string, number>();
 const legacyMap = new Map<string, LegacyCalculator>();
 const orderbookIntegrityMap = new Map<string, OrderbookIntegrityMonitor>();
 const advancedMicroMap = new Map<string, AdvancedMicrostructureMetrics>();
+const pairThresholdMap = new Map<string, PairThresholdCalibrator>();
 
 // Monitor Caches
 const lastOpenInterest = new Map<string, OpenInterestMetrics>();
@@ -1241,6 +1243,10 @@ const getAdvancedMicro = (s: string) => {
     if (!advancedMicroMap.has(s)) advancedMicroMap.set(s, new AdvancedMicrostructureMetrics(s));
     return advancedMicroMap.get(s)!;
 };
+const getPairThresholdCalibrator = (s: string) => {
+    if (!pairThresholdMap.has(s)) pairThresholdMap.set(s, new PairThresholdCalibrator(s));
+    return pairThresholdMap.get(s)!;
+};
 const getIntegrity = (s: string) => {
     if (!orderbookIntegrityMap.has(s)) {
         orderbookIntegrityMap.set(s, new OrderbookIntegrityMonitor(s));
@@ -1288,6 +1294,7 @@ const getHtfMonitor = (s: string) => {
 
 function ensureMonitors(symbol: string) {
     getAdvancedMicro(symbol);
+    getPairThresholdCalibrator(symbol);
     getHtfMonitor(symbol);
     const structureEngine = getStructureEngine(symbol);
     getSessionProfile(symbol);
@@ -2368,6 +2375,16 @@ async function processSymbolEvent(s: string, d: any) {
             const decisionSessionVwap = leg.getSessionVwapSnapshot(Number(t || now), mid);
             const profileSnapshot = sessionProfile.snapshot(Number(t || now), mid);
             const advancedBundleForDecision = advancedMicro.getMetrics(Number(t || now));
+            const expectedSlippagePctForDecision = Math.max(
+                Number(advancedBundleForDecision.liquidityMetrics.expectedSlippageBuy || 0),
+                Number(advancedBundleForDecision.liquidityMetrics.expectedSlippageSell || 0)
+            );
+            const pairThresholdSnapshot = getPairThresholdCalibrator(s).observe({
+                nowMs: Number(t || now),
+                spoofScore: Number(advancedBundleForDecision.passiveFlowMetrics.spoofScore || 0),
+                vpinApprox: Number(advancedBundleForDecision.toxicityMetrics.vpinApprox || 0),
+                expectedSlippageBps: Math.max(0, expectedSlippagePctForDecision) * 100,
+            });
             const spoofAwareObiForDecision = RESILIENCE_PATCHES_ENABLED
                 ? resiliencePatches.getOBI(s, ob.bids, ob.asks, 20, Number(t || now))
                 : null;
@@ -2409,6 +2426,7 @@ async function processSymbolEvent(s: string, d: any) {
                 profile: profileSnapshot,
                 advancedBundle: advancedBundleForDecision,
                 structure: structureSnapshot,
+                adaptiveThresholds: pairThresholdSnapshot,
             });
             if (dryRunSession.isTrackingSymbol(s)) {
                 dryRunSession.updateRuntimeContext(s, {
