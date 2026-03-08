@@ -1200,11 +1200,3 @@ export function exportScenarioResults(results: ScenarioTestResult[], filePath: s
   fs.writeFileSync(filePath, JSON.stringify(exportData, null, 2));
 }
 
-// Export all types
-export {
-  MarketTick,
-  BacktestResult,
-  StrategyResearchHarness,
-  BacktestConfig,
-  StrategyConfig,
-} from './strategy_research_harness';

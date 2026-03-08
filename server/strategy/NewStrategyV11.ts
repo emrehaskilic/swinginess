@@ -1,9 +1,11 @@
 import { DecisionLog } from '../telemetry/DecisionLog';
 import {
+  EntrySetupKind,
   DecisionReason,
   StrategyAction,
   StrategyActionType,
   StrategyConfig,
+  StrategyDecisionContext,
   StrategyDecision,
   StrategyInput,
   StrategyRegime,
@@ -330,8 +332,8 @@ export class NewStrategyV11 {
       return null;
     }
 
-    const filtersOk = this.entryFilters(input, dfsP, dfs, regime, volLevel, thresholds, desiredSide);
-    if (!filtersOk) {
+    const setupKind = this.entryFilters(input, dfsP, dfs, regime, volLevel, thresholds, desiredSide);
+    if (!setupKind) {
       reasons.push('ENTRY_BLOCKED_FILTERS');
       return null;
     }
@@ -342,7 +344,11 @@ export class NewStrategyV11 {
       side: desiredSide,
       reason: regime === 'EV' ? 'ENTRY_EV' : regime === 'MR' ? 'ENTRY_MR' : 'ENTRY_TR',
       expectedPrice: input.market.price,
-      sizeMultiplier: this.getEntrySizeMultiplier(input),
+      sizeMultiplier: this.getEntrySizeMultiplier(input, setupKind),
+      metadata: {
+        setupKind,
+        contextQuality: input.decisionContext?.execution.quality ?? null,
+      },
     };
   }
 
@@ -354,11 +360,20 @@ export class NewStrategyV11 {
   ): StrategySide | null {
     const bias15m = this.bias15m(input);
     const veto1h = this.veto1h(input);
+    const context = this.getDecisionContext(input);
     if (bias15m === 'UP' && veto1h !== 'DOWN' && this.isStructureEntryAligned(input, 'LONG')) {
       return 'LONG';
     }
     if (bias15m === 'DOWN' && veto1h !== 'UP' && this.isStructureEntryAligned(input, 'SHORT')) {
       return 'SHORT';
+    }
+    if (bias15m === 'NEUTRAL' && context?.preferredSetup === 'AUCTION_REVERSION') {
+      if (this.isStructureEntryAligned(input, 'LONG') && this.allowNeutralBiasContinuation(input, 'LONG', dfsP, regime, thresholds)) {
+        return 'LONG';
+      }
+      if (this.isStructureEntryAligned(input, 'SHORT') && this.allowNeutralBiasContinuation(input, 'SHORT', dfsP, regime, thresholds)) {
+        return 'SHORT';
+      }
     }
     return null;
   }
@@ -371,22 +386,31 @@ export class NewStrategyV11 {
     volLevel: number,
     thresholds: { longEntry: number; shortEntry: number },
     desiredSide: StrategySide
-  ): boolean {
+  ): EntrySetupKind | null {
     const bias15m = this.bias15m(input);
     const veto1h = this.veto1h(input);
-    if (desiredSide === 'LONG' && (bias15m !== 'UP' || veto1h === 'DOWN')) {
-      return false;
-    }
-    if (desiredSide === 'SHORT' && (bias15m !== 'DOWN' || veto1h === 'UP')) {
-      return false;
+    if (bias15m !== 'NEUTRAL') {
+      if (desiredSide === 'LONG' && (bias15m !== 'UP' || veto1h === 'DOWN')) {
+        return null;
+      }
+      if (desiredSide === 'SHORT' && (bias15m !== 'DOWN' || veto1h === 'UP')) {
+        return null;
+      }
     }
     if (!this.isStructureEntryAligned(input, desiredSide)) {
-      return false;
+      return null;
     }
-    if (!this.allowTrendCarryEntry(input, desiredSide, dfsP, thresholds)) {
-      return false;
+    if (this.shouldBlockEntryByDecisionContext(input)) {
+      return null;
     }
-    return true;
+    const setupKind = this.resolveEntrySetupKind(input, desiredSide);
+    if (setupKind === 'BREAKOUT_ACCEPTANCE') {
+      return this.allowBreakoutAcceptanceEntry(input, desiredSide, dfsP, thresholds) ? setupKind : null;
+    }
+    if (setupKind === 'AUCTION_REVERSION') {
+      return this.allowAuctionReversionEntry(input, desiredSide, dfsP, regime, thresholds) ? setupKind : null;
+    }
+    return this.allowTrendCarryEntry(input, desiredSide, dfsP, thresholds) ? setupKind : null;
   }
 
   private isLiquidTrendContext(input: StrategyInput): boolean {
@@ -397,6 +421,94 @@ export class NewStrategyV11 {
       && spreadPct <= 0.0004
       && printsPerSecond >= 4
       && tradeCount >= 12;
+  }
+
+  private getDecisionContext(input: StrategyInput): StrategyDecisionContext | null {
+    return input.decisionContext ?? null;
+  }
+
+  private shouldBlockEntryByDecisionContext(input: StrategyInput): boolean {
+    if (!this.config.contextEntryVetoEnabled) return false;
+    const context = this.getDecisionContext(input);
+    if (!context) return false;
+    if (context.execution.quality === 'BLOCKED') return true;
+    if (context.manipulation.spoofScore > this.config.maxSpoofScoreForEntry) return true;
+    if (context.manipulation.vpinApprox > this.config.maxVpinForEntry) return true;
+    if (context.liquidity.expectedSlippageBps > this.config.maxExpectedSlippageBpsForEntry) return true;
+    return false;
+  }
+
+  private shouldBlockAddByDecisionContext(input: StrategyInput): boolean {
+    const context = this.getDecisionContext(input);
+    if (!context) return false;
+    if (context.execution.quality === 'BLOCKED') return true;
+    if (context.manipulation.risk === 'HIGH') return true;
+    if (context.preferredSetup === 'AUCTION_REVERSION') return true;
+    return false;
+  }
+
+  private resolveEntrySetupKind(input: StrategyInput, side: StrategySide): EntrySetupKind {
+    const context = this.getDecisionContext(input);
+    if (!context) return 'TREND_CONTINUATION';
+    if (context.preferredSetup === 'BREAKOUT_ACCEPTANCE') {
+      if ((side === 'LONG' && context.auction.aboveVah) || (side === 'SHORT' && context.auction.belowVal)) {
+        return 'BREAKOUT_ACCEPTANCE';
+      }
+    }
+    if (context.preferredSetup === 'AUCTION_REVERSION') {
+      if (
+        (side === 'LONG' && context.auction.acceptance === 'REJECTING_LOW')
+        || (side === 'SHORT' && context.auction.acceptance === 'REJECTING_HIGH')
+      ) {
+        return 'AUCTION_REVERSION';
+      }
+    }
+    return 'TREND_CONTINUATION';
+  }
+
+  private allowBreakoutAcceptanceEntry(
+    input: StrategyInput,
+    side: StrategySide,
+    dfsP: number,
+    thresholds: { longEntry: number; shortEntry: number }
+  ): boolean {
+    const context = this.getDecisionContext(input);
+    if (!context) return false;
+    if (context.execution.quality === 'BLOCKED') return false;
+    if (!this.allowTrendCarryEntry(input, side, dfsP, thresholds)) return false;
+    if (side === 'LONG') {
+      return context.auction.aboveVah
+        && context.auction.acceptance === 'ACCEPTING_ABOVE'
+        && context.edge.netEdgePct > 0
+        && context.liquidity.quality !== 'TOXIC';
+    }
+    return context.auction.belowVal
+      && context.auction.acceptance === 'ACCEPTING_BELOW'
+      && context.edge.netEdgePct > 0
+      && context.liquidity.quality !== 'TOXIC';
+  }
+
+  private allowAuctionReversionEntry(
+    input: StrategyInput,
+    side: StrategySide,
+    dfsP: number,
+    regime: StrategyRegime,
+    thresholds: { longEntry: number; shortEntry: number }
+  ): boolean {
+    const context = this.getDecisionContext(input);
+    if (!context) return false;
+    if (context.execution.quality === 'BLOCKED') return false;
+    if (!this.allowNeutralBiasContinuation(input, side, dfsP, regime, thresholds) && !this.allowTrendCarryEntry(input, side, dfsP, thresholds)) {
+      return false;
+    }
+    if (side === 'LONG') {
+      return context.auction.acceptance === 'REJECTING_LOW'
+        && !context.auction.aboveVah
+        && Boolean(input.structure?.reclaimUp || input.structure?.continuationLong);
+    }
+    return context.auction.acceptance === 'REJECTING_HIGH'
+      && !context.auction.belowVal
+      && Boolean(input.structure?.reclaimDn || input.structure?.continuationShort);
   }
 
   private allowNeutralBiasContinuation(
@@ -477,6 +589,7 @@ export class NewStrategyV11 {
     dfsP: number,
     thresholds: { longEntry: number; shortEntry: number }
   ): boolean {
+    const context = this.getDecisionContext(input);
     const bias15m = this.bias15m(input);
     const veto1h = this.veto1h(input);
     const price = input.market.price;
@@ -485,6 +598,7 @@ export class NewStrategyV11 {
     const pullbackDistancePct = vwap > 0 ? Math.abs(price - vwap) / vwap : 0;
     const trendState = this.getRuntimeTrendState(input);
     if (input.execution?.orderbookTrusted === false) return false;
+    if (context?.execution.quality === 'BLOCKED') return false;
     if (!this.isAlignedTrendState(side, trendState)) return false;
     if (pullbackDistancePct > 0.012) return false;
     if (!this.hasFeeAwareEdge(input)) return false;
@@ -516,10 +630,20 @@ export class NewStrategyV11 {
       && input.market.obiDeep < 0.25;
   }
 
-  private getEntrySizeMultiplier(input: StrategyInput): number {
-    return this.isEarlySeedPhase(input)
-      ? this.getStartupSeedSizeMultiplier()
-      : 1;
+  private getEntrySizeMultiplier(input: StrategyInput, setupKind: EntrySetupKind): number {
+    if (this.isEarlySeedPhase(input)) {
+      return this.getStartupSeedSizeMultiplier();
+    }
+    if (!this.config.edgeSizingEnabled) return 1;
+    const context = this.getDecisionContext(input);
+    if (!context) return 1;
+    const floor = clamp(Number(this.config.edgeSizeFloorMultiplier || 0.8), 0.1, 1);
+    const ceil = clamp(Number(this.config.edgeSizeCeilMultiplier || 1.15), floor, 1.5);
+    let multiplier = floor + ((ceil - floor) * context.edge.score);
+    if (setupKind === 'BREAKOUT_ACCEPTANCE') multiplier += 0.05;
+    if (context.execution.quality === 'DEGRADED') multiplier *= 0.9;
+    if (context.manipulation.risk === 'MEDIUM') multiplier *= 0.9;
+    return clamp(multiplier, floor, ceil);
   }
 
   private isEarlySeedPhase(input: StrategyInput): boolean {
@@ -537,6 +661,10 @@ export class NewStrategyV11 {
   }
 
   private hasFeeAwareEdge(input: StrategyInput): boolean {
+    const context = this.getDecisionContext(input);
+    if (context?.edge) {
+      return context.edge.netEdgePct > 0 && context.edge.expectedMovePct >= (context.edge.estimatedCostPct * 1.35);
+    }
     const price = Number(input.market.price || 0);
     const vwap = Number(input.market.vwap || 0);
     if (!(price > 0)) return false;
@@ -555,11 +683,13 @@ export class NewStrategyV11 {
     if (input.execution && !input.execution.addonReady) return null;
     if (input.position.addsUsed >= this.config.addSizing.length) return null;
     if (this.config.structureEnabled && !this.hasFreshStructure(input)) return null;
+    if (this.shouldBlockAddByDecisionContext(input)) return null;
     const unrealizedPnlPct = input.position.unrealizedPnlPct ?? 0;
     const timeInPositionMs = Math.max(0, Number(input.position.timeInPositionMs || 0));
     const isWinnerAdd = unrealizedPnlPct > 0;
     if (!isWinnerAdd) return null;
     const side = input.position.side;
+    const context = this.getDecisionContext(input);
     const sideStrength = side === 'LONG' ? dfsP : (1 - dfsP);
     const lastSideStrength = side === 'LONG' ? this.lastDfsPercentile : (1 - this.lastDfsPercentile);
     const bias15m = this.bias15m(input);
@@ -599,6 +729,7 @@ export class NewStrategyV11 {
         addMode: isWinnerAdd ? 'WINNER' : 'DEFENSIVE',
         unrealizedPnlPct,
         structureContinuation: this.hasStructureContinuation(input, side),
+        setupKind: context?.preferredSetup ?? null,
       },
     };
   }
@@ -631,11 +762,37 @@ export class NewStrategyV11 {
     const carryReduceArmed = peakPnlPct >= this.getTrendCarryReduceMinPeakPnlPct();
     const carryReduceTriggered = carryReduceArmed && givebackPct >= this.getTrendCarryReduceGivebackPct();
     const structureInvalidation = this.isStructureInvalidated(input, side);
+    const context = this.getDecisionContext(input);
     const stillHoldingTrendWinner = trendAligned
       && carryReduceArmed
       && !carryReduceTriggered
       && unrealizedPnlPct >= Math.max(0.003, peakPnlPct * 0.45);
     if (softReduceRequireProfit && unrealizedPnlPct <= 0) return null;
+    if (
+      context
+      && (
+        context.manipulation.risk === 'HIGH'
+        || context.liquidity.quality === 'TOXIC'
+        || this.isAuctionReversionAgainstPosition(input, side)
+      )
+      && unrealizedPnlPct > 0
+    ) {
+      this.lastSoftReduceTs = input.nowMs;
+      this.lastSoftReduceSide = side;
+      return {
+        type: StrategyActionType.REDUCE,
+        side,
+        reason: 'REDUCE_SOFT',
+        reducePct: context.execution.quality === 'DEGRADED' ? 0.35 : 0.5,
+        expectedPrice: input.market.price,
+        metadata: {
+          mode: 'CONTEXT_PROTECT',
+          manipulationRisk: context.manipulation.risk,
+          liquidityQuality: context.liquidity.quality,
+          auctionAcceptance: context.auction.acceptance,
+        },
+      };
+    }
     if (structureInvalidation && unrealizedPnlPct > 0) {
       this.lastSoftReduceTs = input.nowMs;
       this.lastSoftReduceSide = side;
@@ -755,6 +912,7 @@ export class NewStrategyV11 {
     const carryHardExitTriggered = carryHardExitArmed && givebackPct >= this.getTrendCarryHardExitGivebackPct();
     const confirmedTrendExit = this.hasConfirmedTrendExitContext(input, side);
     const structureInvalidation = this.isStructureInvalidated(input, side);
+    const context = this.getDecisionContext(input);
     const confirmedOppositePressure = this.adverseTrendBuckets >= this.getTrendExitConfirmBars();
     if (unrealizedPnlPct <= stopLossThreshold) {
       return {
@@ -775,6 +933,22 @@ export class NewStrategyV11 {
     }
     if (this.shouldProtectFreshExit(input, dfsP, thresholds)) {
       return null;
+    }
+    if (
+      context
+      && context.execution.quality === 'BLOCKED'
+      && (context.manipulation.risk === 'HIGH' || this.hasSevereOppositePressure(input, dfsP, thresholds) || unrealizedPnlPct <= 0)
+    ) {
+      return {
+        type: StrategyActionType.EXIT,
+        side,
+        reason: 'EXIT_HARD',
+        expectedPrice: price,
+        metadata: {
+          contextBlocked: true,
+          blockedReasons: context.execution.blockedReasons,
+        },
+      };
     }
     if (structureInvalidation && (!trendAligned || htfOpposes || confirmedTrendExit || unrealizedPnlPct <= 0 || carryHardExitTriggered)) {
       return {
@@ -1037,6 +1211,15 @@ export class NewStrategyV11 {
       && input.market.cvdSlope > 0
       && input.market.obiWeighted > 0.02
       && (printsStrong || burstOpposite);
+  }
+
+  private isAuctionReversionAgainstPosition(input: StrategyInput, side: StrategySide): boolean {
+    const context = this.getDecisionContext(input);
+    if (!context) return false;
+    if (side === 'LONG') {
+      return context.auction.acceptance === 'REJECTING_HIGH';
+    }
+    return context.auction.acceptance === 'REJECTING_LOW';
   }
 
   private hasTrendStructureBreak(
@@ -1431,6 +1614,10 @@ export class NewStrategyV11 {
         structureFresh: input.structure?.isFresh ? 1 : 0,
         structureLongStopAnchor: input.structure?.anchors.longStopAnchor ?? null,
         structureShortStopAnchor: input.structure?.anchors.shortStopAnchor ?? null,
+        contextExecutionConfidence: input.decisionContext?.execution.confidence ?? null,
+        contextEdgeScore: input.decisionContext?.edge.score ?? null,
+        contextSpoofScore: input.decisionContext?.manipulation.spoofScore ?? null,
+        contextSlippageBps: input.decisionContext?.liquidity.expectedSlippageBps ?? null,
       },
       replayInput: INCLUDE_REPLAY_INPUT ? this.cloneReplayInput(input) : undefined,
     };
@@ -1568,6 +1755,70 @@ export class NewStrategyV11 {
             lastConfirmedHL: input.structure.lastConfirmedHL,
             lastConfirmedLH: input.structure.lastConfirmedLH,
             lastConfirmedLL: input.structure.lastConfirmedLL,
+          }
+        : null,
+      decisionContext: input.decisionContext
+        ? {
+            updatedAtMs: input.decisionContext.updatedAtMs,
+            trend: {
+              bias15m: input.decisionContext.trend.bias15m,
+              trendState: input.decisionContext.trend.trendState,
+              trendinessScore: input.decisionContext.trend.trendinessScore,
+              chopScore: input.decisionContext.trend.chopScore,
+              confidence: input.decisionContext.trend.confidence,
+            },
+            liquidity: {
+              quality: input.decisionContext.liquidity.quality,
+              score: input.decisionContext.liquidity.score,
+              expectedSlippageBps: input.decisionContext.liquidity.expectedSlippageBps,
+              effectiveSpreadBps: input.decisionContext.liquidity.effectiveSpreadBps,
+              voidGapScore: input.decisionContext.liquidity.voidGapScore,
+              wallScore: input.decisionContext.liquidity.wallScore,
+            },
+            manipulation: {
+              risk: input.decisionContext.manipulation.risk,
+              spoofScore: input.decisionContext.manipulation.spoofScore,
+              vpinApprox: input.decisionContext.manipulation.vpinApprox,
+              burstPersistenceScore: input.decisionContext.manipulation.burstPersistenceScore,
+              blocked: input.decisionContext.manipulation.blocked,
+              reasons: [...input.decisionContext.manipulation.reasons],
+            },
+            auction: {
+              profile: input.decisionContext.auction.profile
+                ? {
+                    sessionName: input.decisionContext.auction.profile.sessionName,
+                    sessionStartMs: input.decisionContext.auction.profile.sessionStartMs,
+                    bucketSize: input.decisionContext.auction.profile.bucketSize,
+                    poc: input.decisionContext.auction.profile.poc,
+                    vah: input.decisionContext.auction.profile.vah,
+                    val: input.decisionContext.auction.profile.val,
+                    location: input.decisionContext.auction.profile.location,
+                    acceptance: input.decisionContext.auction.profile.acceptance,
+                    distanceToPocBps: input.decisionContext.auction.profile.distanceToPocBps,
+                    distanceToValueEdgeBps: input.decisionContext.auction.profile.distanceToValueEdgeBps,
+                    totalVolume: input.decisionContext.auction.profile.totalVolume,
+                  }
+                : null,
+              location: input.decisionContext.auction.location,
+              acceptance: input.decisionContext.auction.acceptance,
+              inValue: input.decisionContext.auction.inValue,
+              aboveVah: input.decisionContext.auction.aboveVah,
+              belowVal: input.decisionContext.auction.belowVal,
+              distanceToPocBps: input.decisionContext.auction.distanceToPocBps,
+              distanceToValueEdgeBps: input.decisionContext.auction.distanceToValueEdgeBps,
+            },
+            edge: {
+              expectedMovePct: input.decisionContext.edge.expectedMovePct,
+              estimatedCostPct: input.decisionContext.edge.estimatedCostPct,
+              netEdgePct: input.decisionContext.edge.netEdgePct,
+              score: input.decisionContext.edge.score,
+            },
+            execution: {
+              quality: input.decisionContext.execution.quality,
+              blockedReasons: [...input.decisionContext.execution.blockedReasons],
+              confidence: input.decisionContext.execution.confidence,
+            },
+            preferredSetup: input.decisionContext.preferredSetup,
           }
         : null,
       execution: input.execution

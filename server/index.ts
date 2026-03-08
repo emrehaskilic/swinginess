@@ -78,8 +78,10 @@ import {
 } from './metrics/AdvancedMicrostructureMetrics';
 import { SpotReferenceMonitor, SpotReferenceMetrics } from './metrics/SpotReferenceMonitor';
 import { HtfStructureMonitor } from './metrics/HtfStructureMonitor';
+import { SessionProfileTracker } from './metrics/SessionProfileTracker';
 import { CryptoStructureEngine } from './structure/CryptoStructureEngine';
 import { deriveDryRunRuntimeContext } from './runtime/DryRunRuntimeContext';
+import { assembleDecisionContext } from './runtime/DecisionContextAssembler';
 import { deriveBias15m, deriveVeto1h } from './strategy/HtfBias';
 import { SymbolCapitalConfig, materializeSymbolCapitalConfigs, normalizeSymbolCapitalConfigs } from './types/capital';
 import { AnalyticsEngine } from './analytics';
@@ -88,7 +90,7 @@ import {
     type StrategySignal,
 } from './strategies';
 import { ResiliencePatches } from './risk/ResiliencePatches';
-import { StrategyActionType, type StrategyDecision, type StrategySide } from './types/strategy';
+import { StrategyActionType, type StrategyDecision, type StrategyDecisionContext, type StrategySide } from './types/strategy';
 import {
     metrics as observabilityMetrics,
     RiskState as TelemetryRiskState,
@@ -466,6 +468,7 @@ const fundingMonitors = new Map<string, FundingMonitor>();
 const spotReferenceMonitors = new Map<string, SpotReferenceMonitor>();
 const htfMonitors = new Map<string, HtfStructureMonitor>();
 const structureEngineMap = new Map<string, CryptoStructureEngine>();
+const sessionProfileMap = new Map<string, SessionProfileTracker>();
 
 // [PHASE 1 & 2] New Maps
 const backfillMap = new Map<string, KlineBackfill>();
@@ -1260,6 +1263,10 @@ const getStructureEngine = (s: string) => {
     }
     return structureEngineMap.get(s)!;
 };
+const getSessionProfile = (s: string) => {
+    if (!sessionProfileMap.has(s)) sessionProfileMap.set(s, new SessionProfileTracker());
+    return sessionProfileMap.get(s)!;
+};
 const getOICalc = (s: string) => { if (!oiCalculatorMap.has(s)) oiCalculatorMap.set(s, new OICalculator(s, BINANCE_REST_BASE)); return oiCalculatorMap.get(s)!; };
 const getStrategy = (s: string) => { if (!strategyMap.has(s)) strategyMap.set(s, new NewStrategyV11({}, decisionLog)); return strategyMap.get(s)!; };
 const getSpotReference = (s: string) => {
@@ -1283,6 +1290,7 @@ function ensureMonitors(symbol: string) {
     getAdvancedMicro(symbol);
     getHtfMonitor(symbol);
     const structureEngine = getStructureEngine(symbol);
+    getSessionProfile(symbol);
 
     const backfill = getBackfill(symbol);
     const bootstrapState = backfillCoordinator.getState(symbol);
@@ -2294,10 +2302,12 @@ async function processSymbolEvent(s: string, d: any) {
         const leg = getLegacy(s);
         const advancedMicro = getAdvancedMicro(s);
         const structureEngine = getStructureEngine(s);
+        const sessionProfile = getSessionProfile(s);
 
         tas.addTrade({ price: p, quantity: q, side, timestamp: t });
         cvd.addTrade({ price: p, quantity: q, side, timestamp: t });
         leg.addTrade({ price: p, quantity: q, side, timestamp: t });
+        sessionProfile.update(Number(t || now), p, q);
         structureEngine.ingestTrade({
             timestampMs: Number(t || now),
             price: p,
@@ -2356,7 +2366,21 @@ async function processSymbolEvent(s: string, d: any) {
                 : null;
             spreadPct = spreadRatio == null ? null : (spreadRatio * 100);
             const decisionSessionVwap = leg.getSessionVwapSnapshot(Number(t || now), mid);
+            const profileSnapshot = sessionProfile.snapshot(Number(t || now), mid);
             const advancedBundleForDecision = advancedMicro.getMetrics(Number(t || now));
+            const spoofAwareObiForDecision = RESILIENCE_PATCHES_ENABLED
+                ? resiliencePatches.getOBI(s, ob.bids, ob.asks, 20, Number(t || now))
+                : null;
+            const decisionObiWeighted = Number(
+                spoofAwareObiForDecision?.spoofAdjusted
+                    ? spoofAwareObiForDecision.obiWeighted
+                    : (legMetrics?.obiWeighted || 0)
+            );
+            const decisionObiDeep = Number(
+                spoofAwareObiForDecision?.spoofAdjusted
+                    ? spoofAwareObiForDecision.obi
+                    : (legMetrics?.obiDeep || 0)
+            );
             const trendPriceForDecision = Number(mid || p || 0);
             const contextVwapForDecision = Number(decisionSessionVwap?.value || legMetrics?.vwap || trendPriceForDecision || 0);
             const bias15mForDecision: 'UP' | 'DOWN' | 'NEUTRAL' = deriveBias15m(strategyHtfSnapshot?.m15, trendPriceForDecision);
@@ -2366,11 +2390,25 @@ async function processSymbolEvent(s: string, d: any) {
                 trendinessScore: Number(advancedBundleForDecision.regimeMetrics?.trendinessScore || 0),
                 deltaZ: Number(legMetrics?.deltaZ || 0),
                 cvdSlope: Number(legMetrics?.cvdSlope || 0),
-                obiWeighted: Number(legMetrics?.obiWeighted || 0),
+                obiWeighted: decisionObiWeighted,
                 trendPrice: trendPriceForDecision,
                 sessionVwap: contextVwapForDecision,
                 bookMidPrice: Number(mid || 0),
                 referenceTradePrice: Number(p || 0),
+            });
+            const decisionContextForDecision: StrategyDecisionContext = assembleDecisionContext({
+                nowMs: Number(t || now),
+                price: trendPriceForDecision,
+                vwap: contextVwapForDecision,
+                spreadPct,
+                orderbookTrusted,
+                integrityLevel: integrity.level,
+                bias15m: bias15mForDecision,
+                trendState: runtimeContextForDecision.trendState,
+                trendConfidence: runtimeContextForDecision.trendConfidence,
+                profile: profileSnapshot,
+                advancedBundle: advancedBundleForDecision,
+                structure: structureSnapshot,
             });
             if (dryRunSession.isTrackingSymbol(s)) {
                 dryRunSession.updateRuntimeContext(s, {
@@ -2418,8 +2456,8 @@ async function processSymbolEvent(s: string, d: any) {
                     delta5s: legMetrics?.delta5s || 0,
                     deltaZ: legMetrics?.deltaZ || 0,
                     cvdSlope: legMetrics?.cvdSlope || 0,
-                    obiWeighted: legMetrics?.obiWeighted || 0,
-                    obiDeep: legMetrics?.obiDeep || 0,
+                    obiWeighted: decisionObiWeighted,
+                    obiDeep: decisionObiDeep,
                     obiDivergence: legMetrics?.obiDivergence || 0,
                 },
                 openInterest: oiMetrics ? {
@@ -2440,6 +2478,7 @@ async function processSymbolEvent(s: string, d: any) {
                     h1: strategyHtfSnapshot.h1,
                 },
                 structure: structureSnapshot,
+                decisionContext: decisionContextForDecision,
                 execution: {
                     startupMode: dryRunExecutionState?.startupMode ?? 'EARLY_SEED_THEN_MICRO',
                     seedReady: dryRunExecutionState?.seedReady ?? strategyBootstrapSnapshot.backfillDone,
@@ -2730,6 +2769,7 @@ function broadcastMetrics(
         ? ((bestAskPx - bestBidPx) / mid) * 100
         : null;
     const sessionVwap = leg.getSessionVwapSnapshot(now, mid);
+    const sessionProfile = getSessionProfile(s).snapshot(now, mid);
     const htfSnapshot = getHtfMonitor(s).getSnapshot();
 
     const oiM = getOICalc(s).getMetrics();
@@ -2934,6 +2974,7 @@ function broadcastMetrics(
             : null,
         legacyMetrics: legacyForUse,
         sessionVwap,
+        sessionProfile,
         htf: {
             m15: htfSnapshot.m15,
             h1: htfSnapshot.h1,
@@ -2963,6 +3004,7 @@ function broadcastMetrics(
                 lastSwingTimestampMs: snapshot.lastSwingTimestampMs,
             };
         })(),
+        decisionContext: decision?.log?.replayInput?.decisionContext ?? null,
         bootstrap: bootstrapSnapshot,
         orderbookIntegrity: integrity,
         signalDisplay: decisionView.signalDisplay,

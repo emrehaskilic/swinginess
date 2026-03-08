@@ -117,6 +117,93 @@ export interface StrategyPositionState {
 
 export type StrategyTrendState = 'UPTREND' | 'DOWNTREND' | 'PULLBACK_UP' | 'PULLBACK_DOWN' | 'RANGE';
 export type StrategyStartupMode = 'EARLY_SEED_THEN_MICRO' | 'WAIT_MICRO_WARMUP';
+export type AuctionLocation = 'ABOVE_VAH' | 'IN_VALUE' | 'BELOW_VAL' | 'UNKNOWN';
+export type AuctionAcceptance =
+  | 'ACCEPTING_ABOVE'
+  | 'ACCEPTING_VALUE'
+  | 'ACCEPTING_BELOW'
+  | 'REJECTING_HIGH'
+  | 'REJECTING_LOW'
+  | 'NEUTRAL';
+export type LiquidityQuality = 'GOOD' | 'THIN' | 'TOXIC' | 'BLOCKED';
+export type ManipulationRiskLevel = 'LOW' | 'MEDIUM' | 'HIGH';
+export type ExecutionQualityLevel = 'GOOD' | 'DEGRADED' | 'BLOCKED';
+export type EntrySetupKind = 'TREND_CONTINUATION' | 'BREAKOUT_ACCEPTANCE' | 'AUCTION_REVERSION';
+
+export interface SessionProfileSnapshot {
+  sessionName: 'asia' | 'london' | 'ny';
+  sessionStartMs: number;
+  bucketSize: number;
+  poc: number | null;
+  vah: number | null;
+  val: number | null;
+  location: AuctionLocation;
+  acceptance: AuctionAcceptance;
+  distanceToPocBps: number | null;
+  distanceToValueEdgeBps: number | null;
+  totalVolume: number;
+}
+
+export interface TrendDecisionContext {
+  bias15m: 'UP' | 'DOWN' | 'NEUTRAL';
+  trendState: StrategyTrendState | null;
+  trendinessScore: number;
+  chopScore: number;
+  confidence: number;
+}
+
+export interface LiquidityDecisionContext {
+  quality: LiquidityQuality;
+  score: number;
+  expectedSlippageBps: number;
+  effectiveSpreadBps: number;
+  voidGapScore: number;
+  wallScore: number;
+}
+
+export interface ManipulationDecisionContext {
+  risk: ManipulationRiskLevel;
+  spoofScore: number;
+  vpinApprox: number;
+  burstPersistenceScore: number;
+  blocked: boolean;
+  reasons: string[];
+}
+
+export interface AuctionDecisionContext {
+  profile: SessionProfileSnapshot | null;
+  location: AuctionLocation;
+  acceptance: AuctionAcceptance;
+  inValue: boolean;
+  aboveVah: boolean;
+  belowVal: boolean;
+  distanceToPocBps: number | null;
+  distanceToValueEdgeBps: number | null;
+}
+
+export interface EdgeDecisionContext {
+  expectedMovePct: number;
+  estimatedCostPct: number;
+  netEdgePct: number;
+  score: number;
+}
+
+export interface ExecutionDecisionContext {
+  quality: ExecutionQualityLevel;
+  blockedReasons: string[];
+  confidence: number;
+}
+
+export interface StrategyDecisionContext {
+  updatedAtMs: number;
+  trend: TrendDecisionContext;
+  liquidity: LiquidityDecisionContext;
+  manipulation: ManipulationDecisionContext;
+  auction: AuctionDecisionContext;
+  edge: EdgeDecisionContext;
+  execution: ExecutionDecisionContext;
+  preferredSetup: EntrySetupKind | null;
+}
 
 export interface StrategyInput {
   symbol: string;
@@ -179,6 +266,7 @@ export interface StrategyInput {
     } | null;
   } | null;
   structure?: StructureSnapshot | null;
+  decisionContext?: StrategyDecisionContext | null;
   execution?: {
     startupMode?: StrategyStartupMode | null;
     seedReady?: boolean;
@@ -275,6 +363,13 @@ export interface StrategyConfig {
   winnerAddRequireStructure: boolean;
   structureTrailEnabled: boolean;
   structureEntryRequireFreshness: boolean;
+  contextEntryVetoEnabled: boolean;
+  maxSpoofScoreForEntry: number;
+  maxExpectedSlippageBpsForEntry: number;
+  maxVpinForEntry: number;
+  edgeSizingEnabled: boolean;
+  edgeSizeFloorMultiplier: number;
+  edgeSizeCeilMultiplier: number;
 }
 
 export const defaultStrategyConfig: StrategyConfig = {
@@ -325,4 +420,11 @@ export const defaultStrategyConfig: StrategyConfig = {
   winnerAddRequireStructure: String(process.env.STRUCTURE_WINNER_ADD_REQUIRE || 'true').toLowerCase() === 'true',
   structureTrailEnabled: String(process.env.STRUCTURE_TRAIL_ENABLED || 'true').toLowerCase() === 'true',
   structureEntryRequireFreshness: String(process.env.STRUCTURE_ENTRY_REQUIRE_FRESHNESS || 'true').toLowerCase() === 'true',
+  contextEntryVetoEnabled: String(process.env.CONTEXT_ENTRY_VETO_ENABLED || 'true').toLowerCase() === 'true',
+  maxSpoofScoreForEntry: Number(process.env.CONTEXT_MAX_SPOOF_SCORE || 2.25),
+  maxExpectedSlippageBpsForEntry: Number(process.env.CONTEXT_MAX_EXPECTED_SLIPPAGE_BPS || 8),
+  maxVpinForEntry: Number(process.env.CONTEXT_MAX_VPIN || 0.68),
+  edgeSizingEnabled: String(process.env.EDGE_SIZING_ENABLED || 'true').toLowerCase() === 'true',
+  edgeSizeFloorMultiplier: Number(process.env.EDGE_SIZE_FLOOR_MULTIPLIER || 0.75),
+  edgeSizeCeilMultiplier: Number(process.env.EDGE_SIZE_CEIL_MULTIPLIER || 1.1),
 };

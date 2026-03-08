@@ -13,15 +13,19 @@
  */
 
 import { NewStrategyV11 } from '../strategy/NewStrategyV11';
-import { DirectionalFlowScore, DirectionalFlowWeights } from '../strategy/DirectionalFlowScore';
-import { RegimeSelector } from '../strategy/RegimeSelector';
-import { NormalizationStore } from '../strategy/Normalization';
+import { DirectionalFlowWeights } from '../strategy/DirectionalFlowScore';
+import { deriveBias15m, deriveVeto1h } from '../strategy/HtfBias';
 import { InstitutionalRiskEngine } from '../risk/InstitutionalRiskEngine';
+import { SessionProfileTracker } from '../metrics/SessionProfileTracker';
+import type { AdvancedMicrostructureBundle } from '../metrics/AdvancedMicrostructureMetrics';
+import { assembleDecisionContext } from '../runtime/DecisionContextAssembler';
+import { deriveDryRunRuntimeContext } from '../runtime/DryRunRuntimeContext';
 import {
-  StrategyInput as OrderflowInput,
-  Position,
+  StrategyConfig as RuntimeStrategyConfig,
   StrategyDecision,
-} from '../strategy/OrderflowMomentumStrategy';
+  StrategyInput,
+  defaultStrategyConfig as runtimeDefaultStrategyConfig,
+} from '../types/strategy';
 
 // ============================================================================
 // TYPE DEFINITIONS
@@ -105,6 +109,7 @@ export interface SimulatedPosition {
   addsUsed: number;
   unrealizedPnl: number;
   unrealizedPnlPct: number;
+  peakPnlPct: number;
   totalFees: number;
 }
 
@@ -243,63 +248,15 @@ export interface PerformanceMetrics {
 /**
  * Strategy configuration for testing
  */
-export interface StrategyConfig {
-  // Entry thresholds
-  dfsEntryLongBase: number;
-  dfsEntryShortBase: number;
-  dfsBreakLongBase: number;
-  dfsBreakShortBase: number;
-
-  // Volatility thresholds
-  volHighP: number;
-  volLowP: number;
-
-  // Time parameters
-  rollingWindowMin: number;
-  cooldownFlipS: number;
-  cooldownSameS: number;
-  mhtEVs: number;
-  mhtMRs: number;
-  mhtTRs: number;
-
-  // Regime parameters
-  regimeLockTRMRTicks: number;
-  regimeLockEVTicks: number;
-
-  // Hard reversal parameters
-  hardRevDfsP: number;
-  hardRevTicks: number;
-  hardRevRequireAbsorption: boolean;
-
-  // Add sizing
-  addSizing: number[];
-
-  // DFS weights
+export type StrategyConfig = Partial<RuntimeStrategyConfig> & {
   dfsWeights?: Partial<DirectionalFlowWeights>;
-}
+};
 
 /**
  * Default strategy configuration
  */
 export const defaultStrategyConfig: StrategyConfig = {
-  dfsEntryLongBase: 0.85,
-  dfsEntryShortBase: 0.15,
-  dfsBreakLongBase: 0.25,
-  dfsBreakShortBase: 0.75,
-  volHighP: 0.8,
-  volLowP: 0.2,
-  rollingWindowMin: 5,
-  cooldownFlipS: 30,
-  cooldownSameS: 15,
-  mhtEVs: 120,
-  mhtMRs: 45,
-  mhtTRs: 60,
-  regimeLockTRMRTicks: 3,
-  regimeLockEVTicks: 2,
-  hardRevDfsP: 0.15,
-  hardRevTicks: 5,
-  hardRevRequireAbsorption: true,
-  addSizing: [0.5, 0.3, 0.2],
+  ...runtimeDefaultStrategyConfig,
 };
 
 /**
@@ -373,6 +330,8 @@ export class StrategyResearchHarness {
   private riskEngine: InstitutionalRiskEngine;
   private config: BacktestConfig;
   private strategyConfig: StrategyConfig;
+  private sessionProfile = new SessionProfileTracker();
+  private tickHistory: MarketTick[] = [];
 
   // State tracking
   private equity: number = 0;
@@ -436,6 +395,8 @@ export class StrategyResearchHarness {
     this.maxConsecutiveLosses = 0;
     this.entryLatencies = [];
     this.exitLatencies = [];
+    this.sessionProfile = new SessionProfileTracker();
+    this.tickHistory = [];
   }
 
   /**
@@ -481,6 +442,12 @@ export class StrategyResearchHarness {
    */
   private async processTick(tick: MarketTick): Promise<void> {
     if (!this.strategy) return;
+    this.tickHistory.push(tick);
+    const syntheticTradeQty = Math.max(
+      0.001,
+      Number((tick.aggressiveBuyVolume + tick.aggressiveSellVolume) / Math.max(tick.price, 1)),
+    );
+    this.sessionProfile.update(tick.timestampMs, tick.price, syntheticTradeQty);
 
     // Build strategy input
     const input = this.buildStrategyInput(tick);
@@ -513,7 +480,43 @@ export class StrategyResearchHarness {
   /**
    * Build strategy input from market tick
    */
-  private buildStrategyInput(tick: MarketTick): OrderflowInput {
+  private buildStrategyInput(tick: MarketTick): StrategyInput {
+    const spreadRatio = Math.max(0, Number(tick.spreadPct || 0)) / 100;
+    const halfSpreadRatio = spreadRatio / 2;
+    const bestBid = tick.price * (1 - halfSpreadRatio);
+    const bestAsk = tick.price * (1 + halfSpreadRatio);
+    const htf15m = this.buildSyntheticHtfFrame(tick.timestampMs, 15 * 60_000);
+    const htf1h = this.buildSyntheticHtfFrame(tick.timestampMs, 60 * 60_000);
+    const bias15m = deriveBias15m(htf15m, tick.price);
+    const veto1h = deriveVeto1h(htf1h, tick.price);
+    const volatilityAbs = this.deriveAtrLikeVolatility(tick);
+    const runtimeContext = deriveDryRunRuntimeContext({
+      bias15m,
+      trendinessScore: this.deriveTrendinessScore(tick),
+      deltaZ: tick.deltaZ,
+      cvdSlope: tick.cvdSlope,
+      obiWeighted: tick.obiWeighted,
+      trendPrice: tick.price,
+      sessionVwap: tick.vwap,
+      bookMidPrice: (bestBid + bestAsk) / 2,
+      referenceTradePrice: tick.price,
+    });
+    const profile = this.sessionProfile.snapshot(tick.timestampMs, tick.price);
+    const decisionContext = assembleDecisionContext({
+      nowMs: tick.timestampMs,
+      price: tick.price,
+      vwap: tick.vwap,
+      spreadPct: tick.spreadPct,
+      orderbookTrusted: true,
+      integrityLevel: 'OK',
+      bias15m,
+      trendState: runtimeContext.trendState,
+      trendConfidence: runtimeContext.trendConfidence,
+      profile,
+      advancedBundle: this.buildSyntheticAdvancedBundle(tick, volatilityAbs),
+      structure: null,
+    });
+
     return {
       nowMs: tick.timestampMs,
       symbol: tick.symbol,
@@ -532,27 +535,200 @@ export class StrategyResearchHarness {
       orderbook: {
         spreadPct: tick.spreadPct,
         lastUpdatedMs: tick.timestampMs,
+        bestBid,
+        bestAsk,
       },
       trades: {
         aggressiveBuyVolume: tick.aggressiveBuyVolume,
         aggressiveSellVolume: tick.aggressiveSellVolume,
-        printsPerSecond: tick.printsPerSecond,
-        tradeCount: tick.tradeCount,
+        printsPerSecond: Math.max(tick.printsPerSecond, 1),
+        tradeCount: Math.max(tick.tradeCount, 5),
         consecutiveBurst: tick.consecutiveBurst,
         lastUpdatedMs: tick.timestampMs,
       },
-      volatility: tick.volatility,
+      volatility: volatilityAbs,
       absorption: tick.absorption || null,
-      openInterest: tick.openInterest || null,
+      openInterest: tick.openInterest ? {
+        oiChangePct: tick.openInterest.oiChangePct,
+        lastUpdatedMs: tick.timestampMs,
+        source: 'real',
+      } : null,
+      bootstrap: {
+        backfillDone: true,
+        barsLoaded1m: Math.max(1, this.tickHistory.length),
+      },
+      htf: {
+        m15: htf15m,
+        h1: htf1h,
+      },
+      structure: null,
+      decisionContext,
+      execution: {
+        startupMode: 'WAIT_MICRO_WARMUP',
+        seedReady: true,
+        tradeReady: true,
+        addonReady: true,
+        vetoReason: null,
+        orderbookTrusted: true,
+        integrityLevel: 'OK',
+        trendState: runtimeContext.trendState,
+        trendConfidence: runtimeContext.trendConfidence,
+        bias15m,
+        veto1h,
+      },
       position: this.position ? {
         side: this.position.side,
+        qty: this.position.size,
         entryPrice: this.position.entryPrice,
-        entryTimestamp: this.position.entryTimestamp,
-        entryDfs: 0,
-        addsUsed: this.position.addsUsed,
         unrealizedPnlPct: this.position.unrealizedPnlPct,
+        addsUsed: this.position.addsUsed,
+        sizePct: Math.min(1, this.position.entryPrice * this.position.size / Math.max(this.equity, 1)),
+        timeInPositionMs: Math.max(0, tick.timestampMs - this.position.entryTimestamp),
+        peakPnlPct: this.position.peakPnlPct,
       } : null,
-    } as any;
+    };
+  }
+
+  private buildSyntheticHtfFrame(
+    nowMs: number,
+    windowMs: number
+  ): {
+    close: number | null;
+    atr: number | null;
+    lastSwingHigh: number | null;
+    lastSwingLow: number | null;
+    structureBreakUp: boolean;
+    structureBreakDn: boolean;
+  } {
+    const samples = this.tickHistory.filter((sample) => (nowMs - sample.timestampMs) <= windowMs);
+    if (samples.length === 0) {
+      return {
+        close: null,
+        atr: null,
+        lastSwingHigh: null,
+        lastSwingLow: null,
+        structureBreakUp: false,
+        structureBreakDn: false,
+      };
+    }
+    const closes = samples.map((sample) => sample.price);
+    const close = closes[closes.length - 1] ?? null;
+    const lastSwingHigh = closes.length > 0 ? Math.max(...closes) : null;
+    const lastSwingLow = closes.length > 0 ? Math.min(...closes) : null;
+    let atr = 0;
+    for (let index = 1; index < closes.length; index += 1) {
+      atr += Math.abs(closes[index] - closes[index - 1]);
+    }
+    atr = closes.length > 1 ? atr / (closes.length - 1) : 0;
+    const previousWindow = this.tickHistory.filter((sample) => {
+      const age = nowMs - sample.timestampMs;
+      return age > windowMs && age <= (windowMs * 2);
+    });
+    const prevHigh = previousWindow.length > 0 ? Math.max(...previousWindow.map((sample) => sample.price)) : null;
+    const prevLow = previousWindow.length > 0 ? Math.min(...previousWindow.map((sample) => sample.price)) : null;
+
+    return {
+      close,
+      atr,
+      lastSwingHigh,
+      lastSwingLow,
+      structureBreakUp: close != null && prevHigh != null ? close > prevHigh : false,
+      structureBreakDn: close != null && prevLow != null ? close < prevLow : false,
+    };
+  }
+
+  private deriveAtrLikeVolatility(tick: MarketTick): number {
+    const recent = this.tickHistory.slice(-30);
+    if (recent.length < 2) {
+      return Math.max(tick.price * 0.0015, tick.price * Math.max(0.001, tick.volatility * 0.002));
+    }
+    let sum = 0;
+    for (let index = 1; index < recent.length; index += 1) {
+      sum += Math.abs(recent[index].price - recent[index - 1].price);
+    }
+    const averageMove = sum / Math.max(1, recent.length - 1);
+    return Math.max(averageMove, tick.price * 0.001);
+  }
+
+  private deriveTrendinessScore(tick: MarketTick): number {
+    const priceVsVwap = tick.vwap > 0 ? Math.abs(tick.price - tick.vwap) / tick.vwap : 0;
+    return Math.max(0, Math.min(1, (Math.abs(tick.cvdSlope) * 0.35) + (Math.abs(tick.deltaZ) * 0.15) + (priceVsVwap * 25)));
+  }
+
+  private buildSyntheticAdvancedBundle(tick: MarketTick, volatilityAbs: number): AdvancedMicrostructureBundle {
+    const price = Math.max(tick.price, 1);
+    const spreadAbs = price * (Math.max(0, tick.spreadPct) / 100);
+    const signedVolume = tick.aggressiveBuyVolume - tick.aggressiveSellVolume;
+    const totalVolume = Math.max(1, tick.aggressiveBuyVolume + tick.aggressiveSellVolume);
+    const spoofScore = Math.max(0, Math.abs(tick.obiWeighted - tick.obiDeep) * 1.6 + Math.max(0, tick.consecutiveBurst.count - 2) * 0.08);
+    const vpinApprox = Math.max(0, Math.min(1, Math.abs(signedVolume) / totalVolume));
+    const burstPersistenceScore = Math.max(0, Math.min(1, tick.consecutiveBurst.count / 8));
+    const imbalanceBase = Math.max(0, Math.min(1, (tick.obiDeep + 1) / 2));
+    const trendinessScore = this.deriveTrendinessScore(tick);
+
+    return {
+      liquidityMetrics: {
+        microPrice: tick.price,
+        imbalanceCurve: {
+          level1: imbalanceBase,
+          level5: imbalanceBase,
+          level10: imbalanceBase,
+          level20: imbalanceBase,
+          level50: imbalanceBase,
+        },
+        bookSlopeBid: tick.obiWeighted,
+        bookSlopeAsk: -tick.obiWeighted,
+        bookConvexity: Math.abs(tick.obiDivergence) * 0.01,
+        liquidityWallScore: Math.max(0, Math.min(1, Math.abs(tick.obiWeighted))),
+        voidGapScore: Math.max(0, Math.min(1, Number(tick.spreadPct || 0) / 0.2)),
+        expectedSlippageBuy: spreadAbs * 0.6,
+        expectedSlippageSell: spreadAbs * 0.6,
+        resiliencyMs: Math.max(50, 500 - (tick.printsPerSecond * 20)),
+        effectiveSpread: spreadAbs,
+        realizedSpreadShortWindow: spreadAbs * 0.5,
+      },
+      passiveFlowMetrics: {
+        bidAddRate: Math.max(0, tick.aggressiveBuyVolume * 0.1),
+        askAddRate: Math.max(0, tick.aggressiveSellVolume * 0.1),
+        bidCancelRate: Math.max(0, tick.aggressiveSellVolume * 0.05),
+        askCancelRate: Math.max(0, tick.aggressiveBuyVolume * 0.05),
+        depthDeltaDecomposition: {
+          addVolume: totalVolume * 0.2,
+          cancelVolume: totalVolume * 0.1,
+          tradeRelatedVolume: totalVolume * 0.7,
+          netDepthDelta: signedVolume * 0.1,
+        },
+        queueDeltaBestBid: tick.obiWeighted,
+        queueDeltaBestAsk: -tick.obiWeighted,
+        spoofScore,
+        refreshRate: Math.max(0, Math.min(1, tick.printsPerSecond / 10)),
+      },
+      derivativesMetrics: {
+        markLastDeviationPct: 0,
+        indexLastDeviationPct: 0,
+        perpBasis: null,
+        perpBasisZScore: 0,
+        liquidationProxyScore: Math.max(0, Math.min(1, Math.abs(tick.deltaZ) / 4)),
+      },
+      toxicityMetrics: {
+        vpinApprox,
+        signedVolumeRatio: signedVolume / totalVolume,
+        priceImpactPerSignedNotional: signedVolume !== 0 ? Math.abs(tick.price - tick.vwap) / Math.abs(signedVolume) : 0,
+        tradeToBookRatio: Math.max(0, Math.min(2, totalVolume / Math.max(price * 0.01, 1))),
+        burstPersistenceScore,
+      },
+      regimeMetrics: {
+        realizedVol1m: volatilityAbs,
+        realizedVol5m: volatilityAbs * 1.1,
+        realizedVol15m: volatilityAbs * 1.2,
+        volOfVol: volatilityAbs * 0.2,
+        microATR: volatilityAbs,
+        chopScore: Math.max(0, Math.min(1, 1 - trendinessScore)),
+        trendinessScore,
+      },
+      crossMarketMetrics: null,
+      enableCrossMarketConfirmation: false,
+    };
   }
 
   /**
@@ -609,7 +785,8 @@ export class StrategyResearchHarness {
       : tick.price * (1 - slippage);
 
     // Calculate fees
-    const notional = this.config.initialEquity * this.config.positionSize * this.config.leverage;
+    const sizeMultiplier = Number(action.sizeMultiplier || 1);
+    const notional = this.config.initialEquity * this.config.positionSize * sizeMultiplier * this.config.leverage;
     const fees = notional * this.config.takerFee;
 
     // Create position
@@ -622,6 +799,7 @@ export class StrategyResearchHarness {
       addsUsed: 0,
       unrealizedPnl: -fees,
       unrealizedPnlPct: -(fees / this.config.initialEquity),
+      peakPnlPct: 0,
       totalFees: fees,
     };
 
@@ -673,6 +851,7 @@ export class StrategyResearchHarness {
     if (!this.position) return;
 
     const latency = this.simulateLatency('entry');
+    this.entryLatencies.push(latency);
     const slippage = this.calculateSlippage(tick, 'ENTRY', action.side);
     const addPrice = action.side === 'LONG'
       ? tick.price * (1 + slippage)
@@ -723,6 +902,7 @@ export class StrategyResearchHarness {
     const reduceSize = this.position.size * reducePct;
     
     const latency = this.simulateLatency('exit');
+    this.exitLatencies.push(latency);
     const slippage = this.calculateSlippage(tick, 'EXIT', this.position.side);
     const reducePrice = this.position.side === 'LONG'
       ? tick.price * (1 - slippage)
@@ -767,6 +947,8 @@ export class StrategyResearchHarness {
     // Close position if fully reduced
     if (this.position.size <= 0.0001) {
       this.position = null;
+    } else {
+      this.updatePositionPnl(tick);
     }
   }
 
@@ -777,6 +959,7 @@ export class StrategyResearchHarness {
     if (!this.position) return;
 
     const latency = this.simulateLatency('exit');
+    this.exitLatencies.push(latency);
     const slippage = this.calculateSlippage(tick, 'EXIT', this.position.side);
     const exitPrice = this.position.side === 'LONG'
       ? tick.price * (1 - slippage)
@@ -845,6 +1028,7 @@ export class StrategyResearchHarness {
 
     this.position.unrealizedPnl = unrealizedPnl;
     this.position.unrealizedPnlPct = unrealizedPnl / this.config.initialEquity;
+    this.position.peakPnlPct = Math.max(this.position.peakPnlPct, this.position.unrealizedPnlPct);
   }
 
   /**

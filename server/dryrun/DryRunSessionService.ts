@@ -10,6 +10,7 @@ import { FlipGovernor } from './FlipGovernor';
 import { WinnerDecision, WinnerManager, WinnerState } from './WinnerManager';
 import { AddOnManager } from './AddOnManager';
 import { DryRunClock } from './DryRunClock';
+import { ActiveTrade, PositionLifecycleManager } from './PositionLifecycleManager';
 import { MaterializedSymbolCapitalConfig, SymbolCapitalConfig, materializeSymbolCapitalConfigs, normalizeSymbolCapitalConfigs } from '../types/capital';
 import type { StructureBias, StructureSnapshot, SwingLabel } from '../structure/types';
 import { PositionSizer } from '../position/PositionSizer';
@@ -184,26 +185,6 @@ type PendingEntryContext = {
   market?: StrategySignal['market'];
   timestampMs: number;
   leverage: number | null;
-};
-
-type ActiveTrade = {
-  tradeId: string;
-  side: 'LONG' | 'SHORT';
-  entryTimeMs: number;
-  entryPrice: number;
-  qty: number;
-  maxQtySeen: number;
-  notional: number;
-  marginUsed: number;
-  maxMarginUsed: number;
-  leverage: number;
-  pnlRealized: number;
-  feeAcc: number;
-  fundingAcc: number;
-  signalType: string | null;
-  signalScore: number | null;
-  candidate: StrategySignal['candidate'] | null;
-  orderflow: DryRunOrderflowMetrics;
 };
 
 type SignalSnapshot = {
@@ -589,6 +570,7 @@ export class DryRunSessionService {
   private readonly clock = new DryRunClock();
   private readonly winnerManager: WinnerManager;
   private readonly addOnManager: AddOnManager;
+  private readonly positionLifecycle = new PositionLifecycleManager();
 
   constructor(alertService?: AlertService) {
     this.limitStrategy = new LimitOrderStrategy({
@@ -2337,32 +2319,20 @@ export class DryRunSessionService {
   ): void {
     const context = session.pendingEntry;
     const leverage = context?.leverage || session.dynamicLeverage || this.config?.leverage || 1;
-    const entryPrice = Number(position.entryPrice) || 0;
-    const qty = Number(position.qty) || 0;
-    const notional = entryPrice * qty;
-    const marginUsed = leverage > 0 ? notional / leverage : 0;
     const tradeId = `${this.getRunId()}-${session.symbol}-${++session.tradeSeq}`;
     const orderflow = context?.orderflow || this.buildOrderflowMetrics(undefined, session);
-
-    session.currentTrade = {
+    session.currentTrade = this.positionLifecycle.createActiveTrade({
       tradeId,
-      side: position.side,
-      entryTimeMs: eventTimestampMs,
-      entryPrice,
-      qty,
-      maxQtySeen: qty,
-      notional,
-      marginUsed,
-      maxMarginUsed: marginUsed,
+      position,
+      eventTimestampMs,
+      openingFee,
       leverage,
-      pnlRealized: 0,
-      feeAcc: openingFee,
-      fundingAcc: 0,
       signalType: context?.signalType ?? null,
       signalScore: context?.signalScore ?? null,
       candidate: context?.candidate ?? null,
       orderflow,
-    };
+    });
+    const { entryPrice, qty, notional, marginUsed } = session.currentTrade;
 
     this.logTradeEvent({
       type: 'ENTRY',
@@ -2394,14 +2364,7 @@ export class DryRunSessionService {
     reason: string
   ): void {
     const trade = session.currentTrade || this.buildFallbackTrade(session, eventTimestampMs, qty);
-    const realized = trade.pnlRealized;
-    const feeUsdt = trade.feeAcc;
-    const fundingUsdt = trade.fundingAcc;
-    const net = realized - feeUsdt + fundingUsdt;
-    const reportedQty = Math.max(0, Number(trade.maxQtySeen || trade.qty || qty));
-    const marginBase = Math.max(0, Number(trade.maxMarginUsed || trade.marginUsed || 0));
-    const returnPct = marginBase > 0 ? (net / marginBase) * 100 : null;
-    const rMultiple = this.computeRMultiple(trade, net);
+    const exitSnapshot = this.positionLifecycle.buildExitSnapshot(trade);
 
     this.logTradeEvent({
       type: 'EXIT',
@@ -2413,16 +2376,16 @@ export class DryRunSessionService {
       entryTimeMs: trade.entryTimeMs,
       entryPrice: trade.entryPrice,
       exitPrice,
-      qty: reportedQty > 0 ? reportedQty : qty,
+      qty: exitSnapshot.reportedQty > 0 ? exitSnapshot.reportedQty : qty,
       reason,
       durationMs: Math.max(0, eventTimestampMs - trade.entryTimeMs),
       pnl: {
-        realizedUsdt: Number(realized.toFixed(8)),
-        feeUsdt: Number(feeUsdt.toFixed(8)),
-        fundingUsdt: Number(fundingUsdt.toFixed(8)),
-        netUsdt: Number(net.toFixed(8)),
-        returnPct: returnPct === null ? null : Number(returnPct.toFixed(4)),
-        rMultiple: rMultiple === null ? null : Number(rMultiple.toFixed(4)),
+        realizedUsdt: Number(exitSnapshot.realized.toFixed(8)),
+        feeUsdt: Number(exitSnapshot.feeUsdt.toFixed(8)),
+        fundingUsdt: Number(exitSnapshot.fundingUsdt.toFixed(8)),
+        netUsdt: Number(exitSnapshot.net.toFixed(8)),
+        returnPct: exitSnapshot.returnPct === null ? null : Number(exitSnapshot.returnPct.toFixed(4)),
+        rMultiple: exitSnapshot.rMultiple === null ? null : Number(exitSnapshot.rMultiple.toFixed(4)),
       },
       cumulative: this.buildCumulativeSummary(),
       orderflow: trade.orderflow,
@@ -2431,7 +2394,7 @@ export class DryRunSessionService {
 
     const equity = session.lastState.walletBalance + this.computeUnrealizedPnl(session);
     session.performance.recordTrade({
-      realizedPnl: net,
+      realizedPnl: exitSnapshot.net,
       equity,
     });
     session.lastPerfTs = eventTimestampMs;
@@ -2443,27 +2406,13 @@ export class DryRunSessionService {
   private updateTradePosition(session: SymbolSession, position: NonNullable<DryRunStateSnapshot['position']>): void {
     if (!session.currentTrade) return;
     const leverage = session.dynamicLeverage || session.currentTrade.leverage || this.config?.leverage || 1;
-    const entryPrice = Number(position.entryPrice) || session.currentTrade.entryPrice;
-    const qty = Number(position.qty) || session.currentTrade.qty;
-    const notional = entryPrice * qty;
-    const marginUsed = leverage > 0 ? notional / leverage : session.currentTrade.marginUsed;
-
-    session.currentTrade.side = position.side;
-    session.currentTrade.entryPrice = entryPrice;
-    session.currentTrade.qty = qty;
-    session.currentTrade.maxQtySeen = Math.max(Number(session.currentTrade.maxQtySeen || 0), qty);
-    session.currentTrade.notional = notional;
-    session.currentTrade.marginUsed = marginUsed;
-    session.currentTrade.maxMarginUsed = Math.max(Number(session.currentTrade.maxMarginUsed || 0), marginUsed);
-    session.currentTrade.leverage = leverage;
+    this.positionLifecycle.syncTradePosition(session.currentTrade, position, leverage);
   }
 
   private applyTradeAcc(session: SymbolSession, realized: number, fee: number, funding: number): void {
     const trade = session.currentTrade;
     if (!trade) return;
-    trade.pnlRealized += realized;
-    trade.feeAcc += fee;
-    trade.fundingAcc += funding;
+    this.positionLifecycle.accumulateTrade(trade, realized, fee, funding);
   }
 
   private resolveExitReason(
@@ -2472,21 +2421,16 @@ export class DryRunSessionService {
     realized: number,
     fallback: string | null
   ): string {
-    if (liquidation) return 'RISK_EMERGENCY';
-    if (fallback) return fallback;
-    if (session.pendingExitReason) return session.pendingExitReason;
-    if (realized > 0) return 'PROFITLOCK_STOP';
-    if (realized < 0) return 'RISK_EMERGENCY';
-    return 'HARD_INVALIDATION';
+    return this.positionLifecycle.resolveExitReason({
+      pendingExitReason: session.pendingExitReason,
+      liquidation,
+      realized,
+      fallback,
+    });
   }
 
   private computeRMultiple(trade: ActiveTrade, net: number): number | null {
-    const sl = trade.candidate?.slPrice;
-    const qty = Math.max(Number(trade.maxQtySeen || 0), Number(trade.qty || 0));
-    if (!Number.isFinite(sl) || !(qty > 0)) return null;
-    const risk = Math.abs(trade.entryPrice - Number(sl)) * qty;
-    if (!(risk > 0)) return null;
-    return net / risk;
+    return this.positionLifecycle.computeRMultiple(trade, net);
   }
 
   private buildFallbackTradeFromPosition(
@@ -2495,30 +2439,17 @@ export class DryRunSessionService {
     eventTimestampMs: number
   ): ActiveTrade {
     const leverage = session.dynamicLeverage || this.config?.leverage || 1;
-    const entryPrice = Number(position.entryPrice) || session.latestMarkPrice || 0;
-    const size = Number(position.qty) || 0;
-    const notional = entryPrice * size;
-    const marginUsed = leverage > 0 ? notional / leverage : 0;
     const tradeId = `${this.getRunId()}-${session.symbol}-${++session.tradeSeq}`;
-    return {
+    return this.positionLifecycle.createFallbackTrade({
       tradeId,
       side: position.side,
       entryTimeMs: eventTimestampMs,
-      entryPrice,
-      qty: size,
-      maxQtySeen: size,
-      notional,
-      marginUsed,
-      maxMarginUsed: marginUsed,
+      entryPrice: Number(position.entryPrice) || session.latestMarkPrice || 0,
+      qty: Number(position.qty) || 0,
       leverage,
-      pnlRealized: 0,
-      feeAcc: 0,
-      fundingAcc: 0,
-      signalType: null,
-      signalScore: null,
       candidate: null,
       orderflow: this.buildOrderflowMetrics(undefined, session),
-    };
+    });
   }
 
   private buildFallbackTrade(session: SymbolSession, eventTimestampMs: number, qty: number): ActiveTrade {
@@ -2526,30 +2457,17 @@ export class DryRunSessionService {
       return this.buildFallbackTradeFromPosition(session, session.lastState.position, eventTimestampMs);
     }
     const leverage = session.dynamicLeverage || this.config?.leverage || 1;
-    const entryPrice = session.latestMarkPrice || 0;
-    const size = qty || 0;
-    const notional = entryPrice * size;
-    const marginUsed = leverage > 0 ? notional / leverage : 0;
     const tradeId = `${this.getRunId()}-${session.symbol}-${++session.tradeSeq}`;
-    return {
+    return this.positionLifecycle.createFallbackTrade({
       tradeId,
       side: 'LONG',
       entryTimeMs: eventTimestampMs,
-      entryPrice,
-      qty: size,
-      maxQtySeen: size,
-      notional,
-      marginUsed,
-      maxMarginUsed: marginUsed,
+      entryPrice: session.latestMarkPrice || 0,
+      qty: qty || 0,
       leverage,
-      pnlRealized: 0,
-      feeAcc: 0,
-      fundingAcc: 0,
-      signalType: null,
-      signalScore: null,
       candidate: null,
       orderflow: this.buildOrderflowMetrics(undefined, session),
-    };
+    });
   }
 
   private buildCumulativeSummary(): { totalPnL: number; totalTrades: number; winCount: number; winRate: number } {

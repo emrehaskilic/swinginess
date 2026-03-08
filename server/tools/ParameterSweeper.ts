@@ -301,6 +301,46 @@ export const defaultParameterSpace: ParameterSpace = {
       type: 'bool',
       defaultValue: true,
     },
+    {
+      name: 'maxSpoofScoreForEntry',
+      type: 'float',
+      min: 1.25,
+      max: 3.25,
+      step: 0.25,
+      defaultValue: 2.5,
+    },
+    {
+      name: 'maxExpectedSlippageBpsForEntry',
+      type: 'float',
+      min: 4,
+      max: 16,
+      step: 2,
+      defaultValue: 10,
+    },
+    {
+      name: 'maxVpinForEntry',
+      type: 'float',
+      min: 0.5,
+      max: 0.85,
+      step: 0.05,
+      defaultValue: 0.72,
+    },
+    {
+      name: 'edgeSizeFloorMultiplier',
+      type: 'float',
+      min: 0.6,
+      max: 0.95,
+      step: 0.05,
+      defaultValue: 0.8,
+    },
+    {
+      name: 'edgeSizeCeilMultiplier',
+      type: 'float',
+      min: 1.0,
+      max: 1.3,
+      step: 0.05,
+      defaultValue: 1.15,
+    },
   ],
 };
 
@@ -943,11 +983,11 @@ export class ParameterSweeper {
       if (param.type === 'float' || param.type === 'int') {
         const range = ((param.max || 1) - (param.min || 0)) * 0.1;
         const newValue = currentValue + (Math.random() - 0.5) * 2 * range;
-        params[key] = param.type === 'int'
+        (params as any)[key] = param.type === 'int'
           ? Math.round(Math.max(param.min || 0, Math.min(param.max || 1, newValue)))
           : Math.max(param.min || 0, Math.min(param.max || 1, newValue));
       } else {
-        params[key] = this.bestConfig[key];
+        (params as any)[key] = this.bestConfig[key];
       }
     }
 
@@ -1130,7 +1170,7 @@ export function formatSweepResult(result: SweepResult): string {
   let output = `
 === Parameter Sweep Results ===
 Method: ${result.config.method}
-Iterations: ${result.completedIterations}/${result.config.totalIterations}
+Iterations: ${result.completedIterations}/${result.config.maxIterations}
 Duration: ${((result.endTime - result.startTime) / 1000).toFixed(1)}s
 
 === Statistics ===
@@ -1161,5 +1201,4 @@ Score: ${result.bestResult.score.toFixed(4)}
   return output;
 }
 
-// Export all types
-export { StrategyConfig, PerformanceMetrics, MarketTick, BacktestResult };
+export {};
