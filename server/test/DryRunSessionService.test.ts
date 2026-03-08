@@ -1,4 +1,5 @@
 import { DryRunSessionService } from '../dryrun';
+import type { StructureSnapshot } from '../structure/types';
 
 function assert(condition: any, message: string): void {
   if (!condition) throw new Error(message);
@@ -401,13 +402,233 @@ export function runTests() {
     'peak pnl should survive mild pullbacks so strategy trailing logic can use it'
   );
 
+  const prevStructureEnv = process.env.STRUCTURE_ENGINE_ENABLED;
+  process.env.STRUCTURE_ENGINE_ENABLED = 'true';
+
+  const structureSvc = new DryRunSessionService();
+  structureSvc.start({
+    symbols: ['BTCUSDT'],
+    walletBalanceStartUsdt: 5000,
+    initialMarginUsdt: 500,
+    leverage: 10,
+    fundingRate: 0,
+    heartbeatIntervalMs: 1000,
+  });
+  const structureSession = (structureSvc as any).sessions.get('BTCUSDT');
+  structureSession.lastOrderBook = baseBook;
+  structureSession.latestMarkPrice = 100.5;
+  structureSession.lastState = {
+    ...structureSession.lastState,
+    walletBalance: 5000,
+    position: {
+      side: 'LONG',
+      qty: 1,
+      entryPrice: 100,
+      entryTimestampMs: 1_700_000_010_000,
+    },
+    openLimitOrders: [],
+    marginHealth: 1,
+  };
+  structureSession.warmup = {
+    ...structureSession.warmup,
+    bootstrapDone: true,
+    htfReady: true,
+    orderflow1mReady: true,
+    orderflow5mReady: true,
+    orderflow15mReady: true,
+    seedReady: true,
+    tradeReady: true,
+    addonReady: true,
+    vetoReason: null,
+  };
+  structureSvc.updateRuntimeContext('BTCUSDT', {
+    timestampMs: 1_700_000_010_000,
+    bootstrapDone: true,
+    bootstrapBars1m: 1440,
+    htfReady: true,
+    tradeStreamActive: true,
+    orderbookTrusted: true,
+    spreadPct: 0.0004,
+    structure: makeStructureSnapshot(1_700_000_010_000, 99.5, 103.8),
+  });
+  let structureStatus = structureSvc.getStatus().perSymbol.BTCUSDT;
+  assert(structureStatus.structure.structureBias === 'BULLISH', 'dry-run status should expose structure bias');
+  assert(structureStatus.structure.stopAnchor === 99.5, 'dry-run status should expose long stop anchor');
+  assert(structureStatus.structure.targetBand === 103.8, 'dry-run status should expose long target band');
+  structureSvc.updateRuntimeContext('BTCUSDT', {
+    timestampMs: 1_700_000_011_000,
+    structure: makeStructureSnapshot(1_700_000_011_000, 99.1, 104.2),
+  });
+  structureStatus = structureSvc.getStatus().perSymbol.BTCUSDT;
+  assert(structureStatus.structure.stopAnchor === 99.5, 'long structural stop should remain monotonic when a lower anchor appears');
+  structureSvc.updateRuntimeContext('BTCUSDT', {
+    timestampMs: 1_700_000_012_000,
+    structure: makeStructureSnapshot(1_700_000_012_000, 99.9, 104.4),
+  });
+  structureStatus = structureSvc.getStatus().perSymbol.BTCUSDT;
+  assert(structureStatus.structure.stopAnchor === 99.9, 'long structural stop should ratchet higher when a stronger HL is confirmed');
+
+  const blockedStructureSvc = new DryRunSessionService();
+  blockedStructureSvc.start({
+    symbols: ['BTCUSDT'],
+    walletBalanceStartUsdt: 5000,
+    initialMarginUsdt: 500,
+    leverage: 10,
+    fundingRate: 0,
+    heartbeatIntervalMs: 1000,
+  });
+  const blockedStructureSession = (blockedStructureSvc as any).sessions.get('BTCUSDT');
+  blockedStructureSession.lastOrderBook = fastBook;
+  blockedStructureSession.latestMarkPrice = 100.005;
+  blockedStructureSession.warmup = {
+    ...blockedStructureSession.warmup,
+    bootstrapDone: true,
+    htfReady: true,
+    orderflow1mReady: true,
+    orderflow5mReady: true,
+    orderflow15mReady: true,
+    seedReady: true,
+    tradeReady: true,
+    addonReady: true,
+    vetoReason: null,
+  };
+  blockedStructureSvc.updateRuntimeContext('BTCUSDT', {
+    timestampMs: 1_700_000_020_000,
+    bootstrapDone: true,
+    bootstrapBars1m: 1440,
+    htfReady: true,
+    tradeStreamActive: true,
+    orderbookTrusted: true,
+    spreadPct: 0.0001,
+    structure: {
+      ...makeStructureSnapshot(1_700_000_000_000, 99.4, 103.6),
+      isFresh: false,
+      freshnessMs: 20 * 60 * 1000,
+    },
+  });
+  const blockedDecision = blockedStructureSvc.submitStrategyDecision('BTCUSDT', {
+    symbol: 'BTCUSDT',
+    timestampMs: 1_700_000_020_000,
+    regime: 'TR',
+    dfs: 0.8,
+    dfsPercentile: 0.8,
+    volLevel: 0.5,
+    gatePassed: true,
+    reasons: ['ENTRY_TR'],
+    actions: [{ type: 'ENTRY', side: 'LONG', reason: 'ENTRY_TR', expectedPrice: 100 }],
+    log: {
+      timestampMs: 1_700_000_020_000,
+      symbol: 'BTCUSDT',
+      regime: 'TR',
+      gate: { passed: true, reason: null, details: {} },
+      dfs: 0.8,
+      dfsPercentile: 0.8,
+      volLevel: 0.5,
+      thresholds: { longEntry: 0.8, longBreak: 0.6, shortEntry: 0.2, shortBreak: 0.4 },
+      reasons: ['ENTRY_TR'],
+      actions: [{ type: 'ENTRY', side: 'LONG', reason: 'ENTRY_TR', expectedPrice: 100 }],
+      stats: {},
+    },
+  } as any, 1_700_000_020_000);
+  assert(blockedDecision.length === 0, 'stale structure should veto dry-run entry order creation when rollout is enabled');
+
+  blockedStructureSvc.updateRuntimeContext('BTCUSDT', {
+    timestampMs: 1_700_000_021_000,
+    structure: makeStructureSnapshot(1_700_000_021_000, 99.6, 103.9),
+  });
+  const allowedDecision = blockedStructureSvc.submitStrategyDecision('BTCUSDT', {
+    symbol: 'BTCUSDT',
+    timestampMs: 1_700_000_021_000,
+    regime: 'TR',
+    dfs: 0.8,
+    dfsPercentile: 0.8,
+    volLevel: 0.5,
+    gatePassed: true,
+    reasons: ['ENTRY_TR'],
+    actions: [{ type: 'ENTRY', side: 'LONG', reason: 'ENTRY_TR', expectedPrice: 100 }],
+    log: {
+      timestampMs: 1_700_000_021_000,
+      symbol: 'BTCUSDT',
+      regime: 'TR',
+      gate: { passed: true, reason: null, details: {} },
+      dfs: 0.8,
+      dfsPercentile: 0.8,
+      volLevel: 0.5,
+      thresholds: { longEntry: 0.8, longBreak: 0.6, shortEntry: 0.2, shortBreak: 0.4 },
+      reasons: ['ENTRY_TR'],
+      actions: [{ type: 'ENTRY', side: 'LONG', reason: 'ENTRY_TR', expectedPrice: 100 }],
+      stats: {},
+    },
+  } as any, 1_700_000_021_000);
+  assert(allowedDecision.length > 0, 'fresh bullish structure should allow dry-run entry order creation');
+
+  process.env.STRUCTURE_ENGINE_ENABLED = prevStructureEnv;
+
   partialEntrySvc.stop();
   workingOrderSvc.stop();
   adaptiveSpreadSvc.stop();
+  earlySeedSvc.stop();
+  legacyWarmupSvc.stop();
   fastEntrySvc.stop();
   autonomousPathSvc.stop();
   reduceCooldownSvc.stop();
   peakTrackingSvc.stop();
+  structureSvc.stop();
+  blockedStructureSvc.stop();
   const stopped = svc.stop();
   assert(stopped.running === false, 'session must stop cleanly');
+}
+
+function makeStructureSnapshot(timestampMs: number, stopAnchor: number, targetBand: number): StructureSnapshot {
+  return {
+    enabled: true,
+    updatedAtMs: timestampMs,
+    freshnessMs: 0,
+    isFresh: true,
+    bias: 'BULLISH',
+    primaryTimeframe: '3m',
+    recentClose: 100.5,
+    recentAtr: 1.2,
+    sourceBarCount: 120,
+    zone: {
+      high: 101.8,
+      low: 99.2,
+      mid: 100.5,
+      range: 2.6,
+      timeframe: '5m',
+      formedAtMs: timestampMs - 60_000,
+    },
+    anchors: {
+      longStopAnchor: stopAnchor,
+      shortStopAnchor: 101.8,
+      longTargetBand: targetBand,
+      shortTargetBand: 98.7,
+    },
+    bosUp: true,
+    bosDn: false,
+    reclaimUp: false,
+    reclaimDn: false,
+    continuationLong: true,
+    continuationShort: false,
+    lastSwingLabel: 'HL',
+    lastSwingTimestampMs: timestampMs - 60_000,
+    lastConfirmedHH: {
+      label: 'HH',
+      kind: 'HIGH',
+      price: 101.8,
+      timestampMs: timestampMs - (2 * 60_000),
+      timeframe: '3m',
+      index: 1,
+    },
+    lastConfirmedHL: {
+      label: 'HL',
+      kind: 'LOW',
+      price: stopAnchor,
+      timestampMs: timestampMs - 60_000,
+      timeframe: '3m',
+      index: 2,
+    },
+    lastConfirmedLH: null,
+    lastConfirmedLL: null,
+  };
 }

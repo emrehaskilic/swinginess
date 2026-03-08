@@ -67,8 +67,8 @@ export function deriveBias15m(
   referencePrice: number,
 ): FrameBias {
   return deriveFrameBias(frame, referencePrice, {
-    upperPos: 0.58,
-    lowerPos: 0.42,
+    upperPos: 0.72,
+    lowerPos: 0.28,
     rangeBufferPct: 0.08,
     atrBufferMult: 0.15,
   });

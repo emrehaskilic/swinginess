@@ -78,6 +78,7 @@ import {
 } from './metrics/AdvancedMicrostructureMetrics';
 import { SpotReferenceMonitor, SpotReferenceMetrics } from './metrics/SpotReferenceMonitor';
 import { HtfStructureMonitor } from './metrics/HtfStructureMonitor';
+import { CryptoStructureEngine } from './structure/CryptoStructureEngine';
 import { deriveDryRunRuntimeContext } from './runtime/DryRunRuntimeContext';
 import { deriveBias15m, deriveVeto1h } from './strategy/HtfBias';
 import { SymbolCapitalConfig, materializeSymbolCapitalConfigs, normalizeSymbolCapitalConfigs } from './types/capital';
@@ -464,6 +465,7 @@ const oiMonitors = new Map<string, OpenInterestMonitor>();
 const fundingMonitors = new Map<string, FundingMonitor>();
 const spotReferenceMonitors = new Map<string, SpotReferenceMonitor>();
 const htfMonitors = new Map<string, HtfStructureMonitor>();
+const structureEngineMap = new Map<string, CryptoStructureEngine>();
 
 // [PHASE 1 & 2] New Maps
 const backfillMap = new Map<string, KlineBackfill>();
@@ -1245,6 +1247,19 @@ const getIntegrity = (s: string) => {
 
 // [PHASE 1 & 2] New Getters
 const getBackfill = (s: string) => { if (!backfillMap.has(s)) backfillMap.set(s, new KlineBackfill(s)); return backfillMap.get(s)!; };
+const getStructureEngine = (s: string) => {
+    if (!structureEngineMap.has(s)) {
+        structureEngineMap.set(s, new CryptoStructureEngine({
+            enabled: true,
+            structureStaleMs: Number(process.env.STRUCTURE_STALE_MS || 600000),
+            swingLookback: Number(process.env.STRUCTURE_SWING_LOOKBACK || 2),
+            zoneLookback: Number(process.env.STRUCTURE_ZONE_LOOKBACK || 20),
+            bosMinAtr: Number(process.env.STRUCTURE_BOS_MIN_ATR || 0.15),
+            reclaimTolerancePct: Number(process.env.STRUCTURE_RECLAIM_TOLERANCE_PCT || 0.0015),
+        }));
+    }
+    return structureEngineMap.get(s)!;
+};
 const getOICalc = (s: string) => { if (!oiCalculatorMap.has(s)) oiCalculatorMap.set(s, new OICalculator(s, BINANCE_REST_BASE)); return oiCalculatorMap.get(s)!; };
 const getStrategy = (s: string) => { if (!strategyMap.has(s)) strategyMap.set(s, new NewStrategyV11({}, decisionLog)); return strategyMap.get(s)!; };
 const getSpotReference = (s: string) => {
@@ -1267,6 +1282,7 @@ const getHtfMonitor = (s: string) => {
 function ensureMonitors(symbol: string) {
     getAdvancedMicro(symbol);
     getHtfMonitor(symbol);
+    const structureEngine = getStructureEngine(symbol);
 
     const backfill = getBackfill(symbol);
     const bootstrapState = backfillCoordinator.getState(symbol);
@@ -1276,6 +1292,9 @@ function ensureMonitors(symbol: string) {
     const klines = backfillCoordinator.getKlines(symbol);
     if (klines && klines.length > 0) {
         backfill.updateFromKlines(klines);
+        if (!structureEngine.hasSeed()) {
+            structureEngine.seedFromKlines(klines);
+        }
     } else if (!bootstrapState.inProgress && bootstrapState.lastError) {
         backfill.markBackfillError(bootstrapState.lastError);
     }
@@ -2274,10 +2293,16 @@ async function processSymbolEvent(s: string, d: any) {
         const abs = getAbs(s);
         const leg = getLegacy(s);
         const advancedMicro = getAdvancedMicro(s);
+        const structureEngine = getStructureEngine(s);
 
         tas.addTrade({ price: p, quantity: q, side, timestamp: t });
         cvd.addTrade({ price: p, quantity: q, side, timestamp: t });
         leg.addTrade({ price: p, quantity: q, side, timestamp: t });
+        structureEngine.ingestTrade({
+            timestampMs: Number(t || now),
+            price: p,
+            quantity: q,
+        });
         const bestBidForTrade = bestBid(ob);
         const bestAskForTrade = bestAsk(ob);
         const midForTrade = (bestBidForTrade && bestAskForTrade) ? (bestBidForTrade + bestAskForTrade) / 2 : null;
@@ -2305,6 +2330,7 @@ async function processSymbolEvent(s: string, d: any) {
         let spreadRatio: number | null = null;
         let mid = p;
         const strategyHtfSnapshot = getHtfMonitor(s).getSnapshot();
+        const structureSnapshot = structureEngine.getSnapshot(Number(t || now), p);
         const strategyBootstrapState = backfillCoordinator.getState(s);
         const strategyBootstrapSnapshot = {
             backfillInProgress: Boolean(strategyBootstrapState.inProgress),
@@ -2360,6 +2386,7 @@ async function processSymbolEvent(s: string, d: any) {
                     trendConfidence: runtimeContextForDecision.trendConfidence,
                     bias15m: bias15mForDecision,
                     veto1h: veto1hForDecision,
+                    structure: structureSnapshot,
                 });
             }
             const dryRunExecutionState = dryRunSession.isTrackingSymbol(s)
@@ -2412,6 +2439,7 @@ async function processSymbolEvent(s: string, d: any) {
                     m15: strategyHtfSnapshot.m15,
                     h1: strategyHtfSnapshot.h1,
                 },
+                structure: structureSnapshot,
                 execution: {
                     startupMode: dryRunExecutionState?.startupMode ?? 'EARLY_SEED_THEN_MICRO',
                     seedReady: dryRunExecutionState?.seedReady ?? strategyBootstrapSnapshot.backfillDone,
@@ -2911,6 +2939,30 @@ function broadcastMetrics(
             h1: htfSnapshot.h1,
             h4: htfSnapshot.h4,
         },
+        structure: (() => {
+            const snapshot = getStructureEngine(s).getSnapshot(now, mid || null);
+            return {
+                enabled: snapshot.enabled,
+                updatedAtMs: snapshot.updatedAtMs,
+                freshnessMs: snapshot.freshnessMs,
+                isFresh: snapshot.isFresh,
+                bias: snapshot.bias,
+                primaryTimeframe: snapshot.primaryTimeframe,
+                recentClose: snapshot.recentClose,
+                recentAtr: snapshot.recentAtr,
+                sourceBarCount: snapshot.sourceBarCount,
+                zone: snapshot.zone,
+                anchors: snapshot.anchors,
+                bosUp: snapshot.bosUp,
+                bosDn: snapshot.bosDn,
+                reclaimUp: snapshot.reclaimUp,
+                reclaimDn: snapshot.reclaimDn,
+                continuationLong: snapshot.continuationLong,
+                continuationShort: snapshot.continuationShort,
+                lastSwingLabel: snapshot.lastSwingLabel,
+                lastSwingTimestampMs: snapshot.lastSwingTimestampMs,
+            };
+        })(),
         bootstrap: bootstrapSnapshot,
         orderbookIntegrity: integrity,
         signalDisplay: decisionView.signalDisplay,

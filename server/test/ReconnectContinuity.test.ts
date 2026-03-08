@@ -39,8 +39,8 @@ export function runTests() {
     u: 21,
     b: [],
     a: [],
-    eventTimeMs: 2000,
-    receiptTimeMs: 2000,
+    eventTimeMs: 7001,
+    receiptTimeMs: 7001,
   });
   assert(gapFinal.ok === false, 'expired reorder entry should fail with gap');
   // After reconnect (new snapshot)

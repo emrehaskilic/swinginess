@@ -8,6 +8,8 @@ import * as FundingTests from './FundingMonitor.test';
 import * as SessionVwapTrackerTests from './SessionVwapTracker.test';
 import * as BackfillCoordinatorTests from './BackfillCoordinator.test';
 import * as HtfStructureMonitorTests from './HtfStructureMonitor.test';
+import * as CryptoStructureEngineTests from './CryptoStructureEngine.test';
+import * as StructureZoneModelTests from './StructureZoneModel.test';
 import * as LatencyTests from './Latency.test';
 import * as SequenceRuleTests from './SequenceRule.test';
 import * as ReconnectTests from './ReconnectContinuity.test';
@@ -26,6 +28,7 @@ import * as RegimeSelectorTests from './RegimeSelector.test';
 import * as StrategyHysteresisTests from './StrategyHysteresis.test';
 import * as HardReversalTests from './HardReversal.test';
 import * as StrategyRiskTuningTests from './StrategyRiskTuning.test';
+import * as StrategyStructureIntegrationTests from './StrategyStructureIntegration.test';
 import * as MarketImpactSimulatorTests from './MarketImpactSimulator.test';
 import * as OrderbookIntegrityMonitorTests from './OrderbookIntegrityMonitor.test';
 // StrategyEngine removed; NEW_STRATEGY_V1.1 tests below.
@@ -53,6 +56,8 @@ export const testSuites: { name: string; fn: () => void | Promise<void> }[] = [
     { name: 'SessionVwapTracker', fn: SessionVwapTrackerTests.runTests },
     { name: 'BackfillCoordinator', fn: BackfillCoordinatorTests.runTests },
     { name: 'HtfStructureMonitor', fn: HtfStructureMonitorTests.runTests },
+    { name: 'CryptoStructureEngine', fn: CryptoStructureEngineTests.runTests },
+    { name: 'StructureZoneModel', fn: StructureZoneModelTests.runTests },
     { name: 'LatencyClamp', fn: LatencyTests.runTests },
     { name: 'SequenceRule', fn: SequenceRuleTests.runTests },
     { name: 'ReconnectContinuity', fn: ReconnectTests.runTests },
@@ -73,6 +78,7 @@ export const testSuites: { name: string; fn: () => void | Promise<void> }[] = [
     { name: 'StrategyHysteresis', fn: StrategyHysteresisTests.runTests },
     { name: 'HardReversal', fn: HardReversalTests.runTests },
     { name: 'StrategyRiskTuning', fn: StrategyRiskTuningTests.runTests },
+    { name: 'StrategyStructureIntegration', fn: StrategyStructureIntegrationTests.runTests },
     { name: 'DryRunClock', fn: DryRunClockTests.runTests },
     { name: 'FreezeController', fn: FreezeControllerTests.runTests },
     { name: 'PositionSizer', fn: PositionSizerTests.runTests },

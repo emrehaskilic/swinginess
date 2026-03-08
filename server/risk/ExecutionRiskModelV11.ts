@@ -8,6 +8,7 @@ export interface ExecutionRiskInput {
   regime: StrategyRegime;
   liquidationDistance?: number | null; // absolute price distance
   stopDistance?: number | null;
+  stopPrice?: number | null;
 }
 
 export interface ExecutionRiskOutput {
@@ -39,6 +40,10 @@ export class ExecutionRiskModelV11 {
     }
 
     let stopDistance = input.stopDistance ?? 0;
+    const stopPrice = Number(input.stopPrice ?? 0);
+    if (!(stopDistance > 0) && stopPrice > 0 && price > 0) {
+      stopDistance = Math.abs(price - stopPrice);
+    }
     if (!(stopDistance > 0)) {
       if (input.regime === 'TR') {
         stopDistance = Math.max(Math.abs(price - vwap), volatility * 0.5);

@@ -81,7 +81,7 @@ const SNAPSHOT_BRIDGE_BUFFER_MAX = Math.max(200, Number(process.env.ORDERBOOK_SN
 // seconds on busy symbols. If we expire the reorder buffer too early, we resync-loop
 // before the stream catches up and OBI becomes trade-driven instead of depth-driven.
 const REORDER_BUFFER_MAX = Math.max(32, Number(process.env.ORDERBOOK_REORDER_BUFFER_MAX || 1024));
-const REORDER_BUFFER_TTL_MS = Math.max(1000, Number(process.env.ORDERBOOK_REORDER_BUFFER_TTL_MS || 30000));
+const REORDER_BUFFER_TTL_MS = Math.max(1000, Number(process.env.ORDERBOOK_REORDER_BUFFER_TTL_MS || 5000));
 
 type SequenceDecision = 'apply' | 'future' | 'stale' | 'gap';
 

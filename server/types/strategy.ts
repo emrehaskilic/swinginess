@@ -1,3 +1,5 @@
+import type { StructureSnapshot } from '../structure/types';
+
 export const StrategyRegime = {
   EV: 'EV',
   TR: 'TR',
@@ -39,8 +41,10 @@ export type DecisionReason =
   | 'ENTRY_BLOCKED_COOLDOWN'
   | 'ENTRY_BLOCKED_MHT'
   | 'ENTRY_BLOCKED_GATE'
+  | 'ENTRY_BLOCKED_STRUCTURE'
   | 'ENTRY_BLOCKED_FILTERS'
   | 'ADD_WINNER'
+  | 'ADD_BLOCKED_STRUCTURE'
   | 'STRAT_ADD'
   | 'ADD_BLOCKED'
   | 'REDUCE_SOFT'
@@ -174,6 +178,7 @@ export interface StrategyInput {
       structureBreakDn: boolean;
     } | null;
   } | null;
+  structure?: StructureSnapshot | null;
   execution?: {
     startupMode?: StrategyStartupMode | null;
     seedReady?: boolean;
@@ -261,6 +266,15 @@ export interface StrategyConfig {
   trendCarryMinHoldBars?: number;
   trendExitConfirmBars?: number;
   trendReversalConfirmBars?: number;
+  structureEnabled: boolean;
+  structureStaleMs: number;
+  swingLookback: number;
+  zoneLookback: number;
+  bosMinAtr: number;
+  reclaimTolerancePct: number;
+  winnerAddRequireStructure: boolean;
+  structureTrailEnabled: boolean;
+  structureEntryRequireFreshness: boolean;
 }
 
 export const defaultStrategyConfig: StrategyConfig = {
@@ -302,4 +316,13 @@ export const defaultStrategyConfig: StrategyConfig = {
   trendCarryMinHoldBars: Number(process.env.TREND_CARRY_MIN_HOLD_BARS || 2),
   trendExitConfirmBars: Number(process.env.TREND_EXIT_CONFIRM_BARS || 2),
   trendReversalConfirmBars: Number(process.env.TREND_REVERSAL_CONFIRM_BARS || 3),
+  structureEnabled: String(process.env.STRUCTURE_ENGINE_ENABLED || 'false').toLowerCase() === 'true',
+  structureStaleMs: Number(process.env.STRUCTURE_STALE_MS || 600000),
+  swingLookback: Number(process.env.STRUCTURE_SWING_LOOKBACK || 2),
+  zoneLookback: Number(process.env.STRUCTURE_ZONE_LOOKBACK || 20),
+  bosMinAtr: Number(process.env.STRUCTURE_BOS_MIN_ATR || 0.15),
+  reclaimTolerancePct: Number(process.env.STRUCTURE_RECLAIM_TOLERANCE_PCT || 0.0015),
+  winnerAddRequireStructure: String(process.env.STRUCTURE_WINNER_ADD_REQUIRE || 'true').toLowerCase() === 'true',
+  structureTrailEnabled: String(process.env.STRUCTURE_TRAIL_ENABLED || 'true').toLowerCase() === 'true',
+  structureEntryRequireFreshness: String(process.env.STRUCTURE_ENTRY_REQUIRE_FRESHNESS || 'true').toLowerCase() === 'true',
 };

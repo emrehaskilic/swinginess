@@ -150,6 +150,7 @@ type QueueItem = {
 export class DryRunTradeLogger {
   private readonly queue: QueueItem[] = [];
   private readonly streams = new Map<string, fs.WriteStream>();
+  private readonly dropMonitor: NodeJS.Timeout;
   private flushing = false;
   private dropCount = 0;
   private dropWindowCount = 0;
@@ -165,12 +166,13 @@ export class DryRunTradeLogger {
       : 2000;
     this.onDropSpike = config.onDropSpike;
 
-    setInterval(() => {
+    this.dropMonitor = setInterval(() => {
       if (this.dropWindowCount >= this.dropHaltThreshold && this.onDropSpike) {
         this.onDropSpike(this.dropWindowCount);
       }
       this.dropWindowCount = 0;
     }, 10_000);
+    this.dropMonitor.unref();
   }
 
   log(event: DryRunLogEvent): void {
@@ -181,6 +183,7 @@ export class DryRunTradeLogger {
   }
 
   shutdown(): void {
+    clearInterval(this.dropMonitor);
     for (const stream of this.streams.values()) {
       stream.end();
     }

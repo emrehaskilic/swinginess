@@ -11,6 +11,7 @@ import {
   StrategyTrendState,
   defaultStrategyConfig,
 } from '../types/strategy';
+import type { StructureSnapshot } from '../structure/types';
 import { NormalizationStore } from './Normalization';
 import { DirectionalFlowScore } from './DirectionalFlowScore';
 import { RegimeSelector } from './RegimeSelector';
@@ -31,6 +32,7 @@ const DEFAULT_ORDERBOOK_STALE_MIN_PRINTS = 1;
 const DEFAULT_HARD_EXIT_DEBOUNCE_MS = 15_000;
 const DEFAULT_HARD_REVERSAL_DEBOUNCE_MS = 20_000;
 const DEFAULT_TREND_DECISION_BAR_MS = 3 * 60_000;
+const DEFAULT_STRUCTURE_ENTRY_BLOCK_REASON: DecisionReason = 'ENTRY_BLOCKED_STRUCTURE';
 const INCLUDE_REPLAY_INPUT = String(process.env.DECISION_LOG_INCLUDE_REPLAY_INPUT ?? 'true').toLowerCase() !== 'false';
 
 export class NewStrategyV11 {
@@ -310,6 +312,11 @@ export class NewStrategyV11 {
     thresholds: { longEntry: number; shortEntry: number },
     reasons: DecisionReason[]
   ): StrategyAction | null {
+    if (this.config.structureEnabled && !this.hasFreshStructure(input)) {
+      reasons.push(DEFAULT_STRUCTURE_ENTRY_BLOCK_REASON);
+      return null;
+    }
+
     const desiredSide = this.selectEntrySide(input, dfsP, regime, thresholds);
     if (!desiredSide) return null;
 
@@ -347,10 +354,10 @@ export class NewStrategyV11 {
   ): StrategySide | null {
     const bias15m = this.bias15m(input);
     const veto1h = this.veto1h(input);
-    if (bias15m === 'UP' && veto1h !== 'DOWN') {
+    if (bias15m === 'UP' && veto1h !== 'DOWN' && this.isStructureEntryAligned(input, 'LONG')) {
       return 'LONG';
     }
-    if (bias15m === 'DOWN' && veto1h !== 'UP') {
+    if (bias15m === 'DOWN' && veto1h !== 'UP' && this.isStructureEntryAligned(input, 'SHORT')) {
       return 'SHORT';
     }
     return null;
@@ -371,6 +378,9 @@ export class NewStrategyV11 {
       return false;
     }
     if (desiredSide === 'SHORT' && (bias15m !== 'DOWN' || veto1h === 'UP')) {
+      return false;
+    }
+    if (!this.isStructureEntryAligned(input, desiredSide)) {
       return false;
     }
     if (!this.allowTrendCarryEntry(input, desiredSide, dfsP, thresholds)) {
@@ -544,6 +554,7 @@ export class NewStrategyV11 {
     if (!input.position) return null;
     if (input.execution && !input.execution.addonReady) return null;
     if (input.position.addsUsed >= this.config.addSizing.length) return null;
+    if (this.config.structureEnabled && !this.hasFreshStructure(input)) return null;
     const unrealizedPnlPct = input.position.unrealizedPnlPct ?? 0;
     const timeInPositionMs = Math.max(0, Number(input.position.timeInPositionMs || 0));
     const isWinnerAdd = unrealizedPnlPct > 0;
@@ -555,6 +566,7 @@ export class NewStrategyV11 {
     const veto1h = this.veto1h(input);
     if (side === 'LONG' && (bias15m !== 'UP' || veto1h === 'DOWN')) return null;
     if (side === 'SHORT' && (bias15m !== 'DOWN' || veto1h === 'UP')) return null;
+    if (this.config.winnerAddRequireStructure && !this.hasStructureContinuation(input, side)) return null;
     if (isWinnerAdd) {
       if (unrealizedPnlPct < WINNER_ADD_MIN_UPNL_PCT) return null;
       if (timeInPositionMs < WINNER_ADD_MIN_HOLD_MS) return null;
@@ -586,6 +598,7 @@ export class NewStrategyV11 {
         maxPositionSizePct,
         addMode: isWinnerAdd ? 'WINNER' : 'DEFENSIVE',
         unrealizedPnlPct,
+        structureContinuation: this.hasStructureContinuation(input, side),
       },
     };
   }
@@ -617,11 +630,30 @@ export class NewStrategyV11 {
     const givebackPct = this.getProfitGivebackPct(input);
     const carryReduceArmed = peakPnlPct >= this.getTrendCarryReduceMinPeakPnlPct();
     const carryReduceTriggered = carryReduceArmed && givebackPct >= this.getTrendCarryReduceGivebackPct();
+    const structureInvalidation = this.isStructureInvalidated(input, side);
     const stillHoldingTrendWinner = trendAligned
       && carryReduceArmed
       && !carryReduceTriggered
       && unrealizedPnlPct >= Math.max(0.003, peakPnlPct * 0.45);
     if (softReduceRequireProfit && unrealizedPnlPct <= 0) return null;
+    if (structureInvalidation && unrealizedPnlPct > 0) {
+      this.lastSoftReduceTs = input.nowMs;
+      this.lastSoftReduceSide = side;
+      return {
+        type: StrategyActionType.REDUCE,
+        side,
+        reason: 'REDUCE_SOFT',
+        reducePct: trendAligned ? 0.35 : 0.5,
+        expectedPrice: input.market.price,
+        metadata: {
+          unrealizedPnlPct,
+          peakPnlPct,
+          givebackPct,
+          structureInvalidation: true,
+          mode: 'STRUCTURE_INVALIDATION',
+        },
+      };
+    }
     if (htfOpposes) {
       if (!confirmedTrendExit) return null;
       if (stillHoldingTrendWinner && positionAgeMs < (18 * 3 * 60 * 1000)) {
@@ -656,6 +688,7 @@ export class NewStrategyV11 {
       && (lastSideStrength - sideStrength) >= 0.18;
     const adverseFlow = this.hasTrendCarryPressure(input, side);
     const structureBreak = this.hasTrendStructureBreak(input, side, dfsP, thresholds);
+    const agedWinnerGiveback = positionAgeMs >= (15 * 60 * 1000) && carryReduceTriggered && adverseFlow && structureBreak;
     const timeStop = positionAgeMs >= (18 * 3 * 60 * 1000)
       && (!trendAligned || adverseFlow || (side === 'LONG' ? dfsP < 0.45 : dfsP > 0.55));
     const trailingReduce = confirmedTrendExit
@@ -667,7 +700,7 @@ export class NewStrategyV11 {
       && (confirmedTrendExit || htfOpposes)
       && (!stillHoldingTrendWinner || carryReduceTriggered || unrealizedPnlPct <= 0.002);
 
-    if (trailingReduce || timeStopTriggered) {
+    if (trailingReduce || timeStopTriggered || agedWinnerGiveback) {
       this.lastSoftReduceTs = input.nowMs;
       this.lastSoftReduceSide = side;
       return {
@@ -682,6 +715,7 @@ export class NewStrategyV11 {
           givebackPct,
           carryReduceTriggered,
           timeStop: timeStopTriggered,
+          agedWinnerGiveback,
           adverseFlow,
           structureBreak,
           trendAligned,
@@ -704,6 +738,7 @@ export class NewStrategyV11 {
     const veto1h = this.veto1h(input);
     const positionAgeMs = this.getPositionAgeMs(input) ?? 0;
     const trendAligned = this.isTrendAligned(side, bias15m, veto1h);
+    const htfOpposes = this.isHtfOpposing(side, bias15m, veto1h);
     const vwapHoldTicks = this.config.hardRevTicks;
     const configuredMaxLossPct = Number.isFinite(this.config.maxLossPct as number)
       ? Math.min(-0.0001, Number(this.config.maxLossPct))
@@ -719,6 +754,8 @@ export class NewStrategyV11 {
     const carryHardExitArmed = peakPnlPct >= this.getTrendCarryHardExitMinPeakPnlPct();
     const carryHardExitTriggered = carryHardExitArmed && givebackPct >= this.getTrendCarryHardExitGivebackPct();
     const confirmedTrendExit = this.hasConfirmedTrendExitContext(input, side);
+    const structureInvalidation = this.isStructureInvalidated(input, side);
+    const confirmedOppositePressure = this.adverseTrendBuckets >= this.getTrendExitConfirmBars();
     if (unrealizedPnlPct <= stopLossThreshold) {
       return {
         type: StrategyActionType.EXIT,
@@ -739,9 +776,34 @@ export class NewStrategyV11 {
     if (this.shouldProtectFreshExit(input, dfsP, thresholds)) {
       return null;
     }
+    if (structureInvalidation && (!trendAligned || htfOpposes || confirmedTrendExit || unrealizedPnlPct <= 0 || carryHardExitTriggered)) {
+      return {
+        type: StrategyActionType.EXIT,
+        side,
+        reason: 'EXIT_HARD',
+        expectedPrice: price,
+        metadata: {
+          structureInvalidation: true,
+          trendAligned,
+          htfOpposes,
+          confirmedTrendExit,
+        },
+      };
+    }
+
+    if (
+      positionAgeMs >= (15 * 60 * 1000)
+      && carryHardExitTriggered
+      && (!trendAligned || htfOpposes)
+      && this.hasDirectCarryShock(input, side, dfsP, thresholds)
+    ) {
+      return { type: StrategyActionType.EXIT, side, reason: 'EXIT_HARD', expectedPrice: price };
+    }
 
     if (this.hasSevereOppositePressure(input, dfsP, thresholds)) {
-      if (confirmedTrendExit && (!trendAligned || unrealizedPnlPct <= 0 || carryHardExitTriggered)) {
+      const ageMs = this.getPositionAgeMs(input);
+      const missingAgeEmergency = ageMs === null;
+      if ((confirmedTrendExit || missingAgeEmergency) && (!trendAligned || unrealizedPnlPct <= 0 || carryHardExitTriggered)) {
         return { type: StrategyActionType.EXIT, side, reason: 'EXIT_HARD', expectedPrice: price };
       }
       return null;
@@ -749,14 +811,14 @@ export class NewStrategyV11 {
 
     const strongStructureFailure = side === 'LONG'
       ? price < vwap
-        && this.vwapBelowTicks >= Math.max(6, vwapHoldTicks)
+        && (this.vwapBelowTicks >= Math.max(6, vwapHoldTicks) || confirmedOppositePressure)
         && dfsP <= Math.min(0.22, thresholds.longBreak - 0.15)
         && input.market.deltaZ <= -1.2
         && input.market.delta5s < 0
         && input.market.cvdSlope < 0
         && input.market.obiWeighted < -0.05
       : price > vwap
-        && this.vwapAboveTicks >= Math.max(6, vwapHoldTicks)
+        && (this.vwapAboveTicks >= Math.max(6, vwapHoldTicks) || confirmedOppositePressure)
         && dfsP >= Math.max(0.78, thresholds.shortBreak + 0.15)
         && input.market.deltaZ >= 1.2
         && input.market.delta5s > 0
@@ -817,15 +879,22 @@ export class NewStrategyV11 {
     const obiDiv = input.market.obiDivergence;
     const obiDivOpposite = side === 'LONG' ? obiDiv < 0 : obiDiv > 0;
 
+    const reversalDfsThreshold = Math.max(this.config.hardRevDfsP, 0.18);
     const counterAggression = side === 'LONG'
-      ? dfsP <= this.config.hardRevDfsP && input.market.cvdSlope < 0 && input.market.obiDeep < 0
-      : dfsP >= (1 - this.config.hardRevDfsP) && input.market.cvdSlope > 0 && input.market.obiDeep > 0;
+      ? dfsP <= reversalDfsThreshold && input.market.cvdSlope < 0 && input.market.obiDeep < 0
+      : dfsP >= (1 - reversalDfsThreshold) && input.market.cvdSlope > 0 && input.market.obiDeep > 0;
 
     const vwapHold = side === 'LONG'
       ? this.vwapBelowTicks >= this.config.hardRevTicks
       : this.vwapAboveTicks >= this.config.hardRevTicks;
+    const confirmedOppositePersistence = this.adverseTrendBuckets >= this.getTrendReversalConfirmBars();
+    const persistentOppositeContext = vwapHold || confirmedOppositePersistence;
 
-    if (extreme && stall && obiDivOpposite && counterAggression && vwapHold) {
+    if (extreme && stall && obiDivOpposite && counterAggression && persistentOppositeContext) {
+      return { valid: true, reason: 'EXIT_HARD_REVERSAL' };
+    }
+
+    if (absorptionOk && obiDivOpposite && counterAggression && persistentOppositeContext) {
       return { valid: true, reason: 'EXIT_HARD_REVERSAL' };
     }
 
@@ -906,6 +975,52 @@ export class NewStrategyV11 {
     return brokenStructurePressure || tapeShockPressure;
   }
 
+  private hasDirectCarryShock(
+    input: StrategyInput,
+    side: StrategySide,
+    dfsP: number,
+    thresholds: { longBreak: number; shortBreak: number }
+  ): boolean {
+    const burstSide = input.trades.consecutiveBurst.side;
+    const burstAligned = side === 'LONG' ? burstSide === 'sell' : burstSide === 'buy';
+    const burstCount = Number(input.trades.consecutiveBurst.count || 0);
+    const printsStrong = this.norm.percentile('prints', input.trades.printsPerSecond) >= 0.7 || input.trades.printsPerSecond >= 8;
+    const dfsBroken = side === 'LONG'
+      ? dfsP <= Math.min(0.25, thresholds.longBreak - 0.1)
+      : dfsP >= Math.max(0.75, thresholds.shortBreak + 0.1);
+    const flowAligned = side === 'LONG'
+      ? input.market.deltaZ <= -1.2
+        && input.market.delta5s < 0
+        && input.market.cvdSlope < 0
+        && input.market.obiWeighted < -0.05
+        && input.market.obiDeep < -0.02
+      : input.market.deltaZ >= 1.2
+        && input.market.delta5s > 0
+        && input.market.cvdSlope > 0
+        && input.market.obiWeighted > 0.05
+        && input.market.obiDeep > 0.02;
+    const bias15m = this.bias15m(input);
+    const veto1h = this.veto1h(input);
+    const htfOpposes = this.isHtfOpposing(side, bias15m, veto1h);
+    const htfBroken = side === 'LONG'
+      ? Boolean(input.htf?.m15?.structureBreakDn || input.htf?.h1?.structureBreakDn || veto1h === 'DOWN')
+      : Boolean(input.htf?.m15?.structureBreakUp || input.htf?.h1?.structureBreakUp || veto1h === 'UP');
+    const extremeOppositeTape = side === 'LONG'
+      ? input.market.deltaZ <= -3
+        && input.market.delta5s < -1
+        && input.market.cvdSlope < -1
+        && input.market.obiDeep < -0.4
+      : input.market.deltaZ >= 3
+        && input.market.delta5s > 1
+        && input.market.cvdSlope > 1
+        && input.market.obiDeep > 0.4;
+    const impulseExtreme = side === 'LONG' ? input.market.delta1s <= -4 : input.market.delta1s >= 4;
+    return (htfOpposes || htfBroken || extremeOppositeTape)
+      && flowAligned
+      && dfsBroken
+      && (burstAligned && burstCount >= Math.max(8, this.config.hardRevTicks + 3) || (printsStrong && impulseExtreme));
+  }
+
   private hasTrendCarryPressure(input: StrategyInput, side: StrategySide): boolean {
     const burstSide = input.trades.consecutiveBurst.side;
     const burstOpposite = side === 'LONG' ? burstSide === 'sell' : burstSide === 'buy';
@@ -939,7 +1054,10 @@ export class NewStrategyV11 {
     const vwapBroken = side === 'LONG'
       ? input.market.price < input.market.vwap
       : input.market.price > input.market.vwap;
-    return vwapPersist && dfsBroken && vwapBroken;
+    const momentumBroken = side === 'LONG'
+      ? input.market.deltaZ <= -1.2 && input.market.delta5s < 0 && input.market.cvdSlope < 0
+      : input.market.deltaZ >= 1.2 && input.market.delta5s > 0 && input.market.cvdSlope > 0;
+    return (vwapPersist && dfsBroken && vwapBroken) || (vwapBroken && dfsBroken && momentumBroken);
   }
 
   private isTrendAligned(side: StrategySide, bias15m: 'UP' | 'DOWN' | 'NEUTRAL', veto1h: 'NONE' | 'UP' | 'DOWN'): boolean {
@@ -1110,8 +1228,8 @@ export class NewStrategyV11 {
   }
 
   private hasConfirmedTrendExitContext(input: StrategyInput, side: StrategySide): boolean {
-    const ageMs = this.getPositionAgeMs(input) ?? 0;
-    if (ageMs < this.getTrendCarryMinHoldMs()) return false;
+    const ageMs = this.getPositionAgeMs(input);
+    if (ageMs !== null && ageMs < this.getTrendCarryMinHoldMs()) return false;
     const bias15m = this.bias15m(input);
     const veto1h = this.veto1h(input);
     const htfOpposes = this.isHtfOpposing(side, bias15m, veto1h);
@@ -1128,8 +1246,8 @@ export class NewStrategyV11 {
   }
 
   private hasConfirmedTrendReversalContext(input: StrategyInput, side: StrategySide): boolean {
-    const ageMs = this.getPositionAgeMs(input) ?? 0;
-    if (ageMs < Math.max(this.getFreshReversalProtectMs(), this.getTrendCarryMinHoldMs())) return false;
+    const ageMs = this.getPositionAgeMs(input);
+    if (ageMs !== null && ageMs < Math.max(this.getFreshReversalProtectMs(), this.getTrendCarryMinHoldMs())) return false;
     const bias15m = this.bias15m(input);
     const veto1h = this.veto1h(input);
     const trendState = this.getRuntimeTrendState(input);
@@ -1138,7 +1256,8 @@ export class NewStrategyV11 {
   }
 
   private isTrendCarryHoldLocked(input: StrategyInput, side: StrategySide): boolean {
-    const ageMs = this.getPositionAgeMs(input) ?? 0;
+    const ageMs = this.getPositionAgeMs(input);
+    if (ageMs === null) return false;
     if (ageMs >= this.getTrendCarryMinHoldMs()) return false;
     return this.isAlignedTrendState(side, this.getRuntimeTrendState(input));
   }
@@ -1193,6 +1312,53 @@ export class NewStrategyV11 {
       this.vwapAboveTicks += 1;
       this.vwapBelowTicks = 0;
     }
+  }
+
+  private getStructure(input: StrategyInput): StructureSnapshot | null {
+    if (!this.config.structureEnabled) return null;
+    if (!input.structure) return null;
+    return input.structure;
+  }
+
+  private hasFreshStructure(input: StrategyInput): boolean {
+    const structure = this.getStructure(input);
+    if (!structure) return false;
+    if (!this.config.structureEntryRequireFreshness) return true;
+    return Boolean(structure.isFresh);
+  }
+
+  private isStructureEntryAligned(input: StrategyInput, side: StrategySide): boolean {
+    if (!this.config.structureEnabled) return true;
+    const structure = this.getStructure(input);
+    if (!structure) return false;
+    if (this.config.structureEntryRequireFreshness && !structure.isFresh) return false;
+    if (side === 'LONG') {
+      return structure.bias === 'BULLISH' && (structure.bosUp || structure.reclaimUp);
+    }
+    return structure.bias === 'BEARISH' && (structure.bosDn || structure.reclaimDn);
+  }
+
+  private hasStructureContinuation(input: StrategyInput, side: StrategySide): boolean {
+    if (!this.config.structureEnabled) return true;
+    const structure = this.getStructure(input);
+    if (!structure || !structure.isFresh) return false;
+    return side === 'LONG'
+      ? Boolean(structure.continuationLong && structure.bias !== 'BEARISH')
+      : Boolean(structure.continuationShort && structure.bias !== 'BULLISH');
+  }
+
+  private isStructureInvalidated(input: StrategyInput, side: StrategySide): boolean {
+    if (!this.config.structureEnabled) return false;
+    const structure = this.getStructure(input);
+    if (!structure || !structure.isFresh) return false;
+    const price = Number(input.market.price || 0);
+    if (!(price > 0)) return false;
+    if (side === 'LONG') {
+      const stopAnchor = this.config.structureTrailEnabled ? structure.anchors.longStopAnchor : null;
+      return Boolean(structure.bosDn || (stopAnchor != null && price <= stopAnchor));
+    }
+    const stopAnchor = this.config.structureTrailEnabled ? structure.anchors.shortStopAnchor : null;
+    return Boolean(structure.bosUp || (stopAnchor != null && price >= stopAnchor));
   }
 
   private flipSide(side: StrategySide): StrategySide {
@@ -1262,6 +1428,9 @@ export class NewStrategyV11 {
         unrealizedPnlPct: input.position?.unrealizedPnlPct ?? null,
         peakPnlPct: input.position?.peakPnlPct ?? null,
         givebackPnlPct: input.position ? this.getProfitGivebackPct(input) : null,
+        structureFresh: input.structure?.isFresh ? 1 : 0,
+        structureLongStopAnchor: input.structure?.anchors.longStopAnchor ?? null,
+        structureShortStopAnchor: input.structure?.anchors.shortStopAnchor ?? null,
       },
       replayInput: INCLUDE_REPLAY_INPUT ? this.cloneReplayInput(input) : undefined,
     };
@@ -1358,6 +1527,47 @@ export class NewStrategyV11 {
                   structureBreakDn: input.htf.h1.structureBreakDn,
                 }
               : null,
+          }
+        : null,
+      structure: input.structure
+        ? {
+            enabled: input.structure.enabled,
+            updatedAtMs: input.structure.updatedAtMs,
+            freshnessMs: input.structure.freshnessMs,
+            isFresh: input.structure.isFresh,
+            bias: input.structure.bias,
+            primaryTimeframe: input.structure.primaryTimeframe,
+            recentClose: input.structure.recentClose,
+            recentAtr: input.structure.recentAtr,
+            sourceBarCount: input.structure.sourceBarCount,
+            zone: input.structure.zone
+              ? {
+                  high: input.structure.zone.high,
+                  low: input.structure.zone.low,
+                  mid: input.structure.zone.mid,
+                  range: input.structure.zone.range,
+                  timeframe: input.structure.zone.timeframe,
+                  formedAtMs: input.structure.zone.formedAtMs,
+                }
+              : null,
+            anchors: {
+              longStopAnchor: input.structure.anchors.longStopAnchor,
+              shortStopAnchor: input.structure.anchors.shortStopAnchor,
+              longTargetBand: input.structure.anchors.longTargetBand,
+              shortTargetBand: input.structure.anchors.shortTargetBand,
+            },
+            bosUp: input.structure.bosUp,
+            bosDn: input.structure.bosDn,
+            reclaimUp: input.structure.reclaimUp,
+            reclaimDn: input.structure.reclaimDn,
+            continuationLong: input.structure.continuationLong,
+            continuationShort: input.structure.continuationShort,
+            lastSwingLabel: input.structure.lastSwingLabel,
+            lastSwingTimestampMs: input.structure.lastSwingTimestampMs,
+            lastConfirmedHH: input.structure.lastConfirmedHH,
+            lastConfirmedHL: input.structure.lastConfirmedHL,
+            lastConfirmedLH: input.structure.lastConfirmedLH,
+            lastConfirmedLL: input.structure.lastConfirmedLL,
           }
         : null,
       execution: input.execution

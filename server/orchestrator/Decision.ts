@@ -43,7 +43,18 @@ export class DecisionEngine {
       return [{ type: 'NOOP', symbol, event_time_ms, reason: `gate_fail:${gate.reason || 'unknown'}` }];
     }
 
-    const price = this.resolveMarketPrice(metrics, state.position?.side || null) ?? 0;
+    const resolvedPrice = this.resolveMarketPrice(metrics, state.position?.side || null);
+    const fallbackSide = state.position?.side === 'SHORT' ? 'BUY' : 'SELL';
+    const fallbackExpectedPrice = this.deps.expectedPrice(symbol, fallbackSide, 'MARKET');
+    const price = resolvedPrice ?? fallbackExpectedPrice ?? 0;
+    const legacyDeltaZ = Number(metrics.legacyMetrics?.deltaZ ?? 0);
+    const legacyCvdSlope = Number(metrics.legacyMetrics?.cvdSlope ?? 0);
+    const legacyObiDeep = Number(metrics.legacyMetrics?.obiDeep ?? 0);
+    const printsPerSecond = Math.max(0, Number(metrics.prints_per_second ?? 0));
+    const tradeCount = Math.max(5, Math.round(printsPerSecond * 60));
+    const syntheticBurstSide = legacyDeltaZ > 0 ? 'buy' : legacyDeltaZ < 0 ? 'sell' : null;
+    const syntheticBurstCount = Math.max(0, Math.round(Math.abs(legacyDeltaZ) * 3));
+    const position = this.toStrategyPosition(state.position, price);
     const dfsInput: StrategyInput = {
       symbol,
       nowMs: event_time_ms,
@@ -56,36 +67,38 @@ export class DecisionEngine {
       },
       trades: {
         lastUpdatedMs: metrics.exchange_event_time_ms ?? event_time_ms,
-        printsPerSecond: metrics.prints_per_second ?? 0,
-        tradeCount: Math.max(0, Math.round((metrics.prints_per_second ?? 0) * 60)),
-        aggressiveBuyVolume: 0,
-        aggressiveSellVolume: 0,
-        consecutiveBurst: { side: null, count: 0 },
+        printsPerSecond,
+        tradeCount,
+        aggressiveBuyVolume: legacyDeltaZ > 0 ? Math.abs(legacyDeltaZ) * Math.max(1, printsPerSecond) : 0,
+        aggressiveSellVolume: legacyDeltaZ < 0 ? Math.abs(legacyDeltaZ) * Math.max(1, printsPerSecond) : 0,
+        consecutiveBurst: { side: syntheticBurstSide, count: syntheticBurstCount },
       },
       market: {
         price,
         vwap: price,
-        delta1s: 0,
-        delta5s: 0,
-        deltaZ: metrics.legacyMetrics?.deltaZ ?? 0,
-        cvdSlope: metrics.legacyMetrics?.cvdSlope ?? 0,
-        obiWeighted: 0,
-        obiDeep: metrics.legacyMetrics?.obiDeep ?? 0,
+        delta1s: legacyDeltaZ,
+        delta5s: legacyDeltaZ,
+        deltaZ: legacyDeltaZ,
+        cvdSlope: legacyCvdSlope,
+        obiWeighted: legacyObiDeep,
+        obiDeep: legacyObiDeep,
         obiDivergence: 0,
       },
       openInterest: null,
       absorption: null,
+      bootstrap: {
+        backfillDone: true,
+        barsLoaded1m: 1440,
+      },
+      execution: {
+        tradeReady: true,
+        addonReady: true,
+        vetoReason: null,
+        orderbookTrusted: true,
+        integrityLevel: 'OK',
+      },
       volatility: metrics.advancedMetrics?.volatilityIndex ?? 0,
-      position: state.position
-        ? {
-            side: state.position.side === 'LONG' ? 'LONG' : 'SHORT',
-            qty: state.position.qty,
-            entryPrice: state.position.entryPrice,
-            unrealizedPnlPct: state.position.unrealizedPnlPct,
-            addsUsed: state.position.addsUsed,
-            peakPnlPct: state.position.peakPnlPct,
-          }
-        : null,
+      position,
     };
 
     const decision = this.strategy.evaluate(dfsInput);
@@ -142,6 +155,13 @@ export class DecisionEngine {
       }
     }
 
+    if (actions.length === 0) {
+      const fallbackAction = this.maybeEmitSoftReduceFallback(symbol, event_time_ms, metrics, state, price);
+      if (fallbackAction) {
+        return [fallbackAction];
+      }
+    }
+
     return actions.length > 0 ? actions : [{ type: 'NOOP', symbol, event_time_ms, reason: 'no_action' }];
   }
 
@@ -160,6 +180,85 @@ export class DecisionEngine {
       return (bid + ask) / 2;
     }
     return null;
+  }
+
+  private toStrategyPosition(
+    position: SymbolState['position'],
+    price: number,
+  ): StrategyInput['position'] {
+    if (!position) return null;
+    const livePnlPct = this.estimateLivePnlPct(position.side, position.entryPrice, price);
+    const unrealizedPnlPct = livePnlPct ?? this.normalizeOrchestratorPnl(position.unrealizedPnlPct);
+    const peakPnlPct = Math.max(
+      unrealizedPnlPct,
+      this.normalizeOrchestratorPnl(position.peakPnlPct),
+    );
+    return {
+      side: position.side === 'LONG' ? 'LONG' : 'SHORT',
+      qty: position.qty,
+      entryPrice: position.entryPrice,
+      unrealizedPnlPct,
+      addsUsed: position.addsUsed,
+      peakPnlPct,
+    };
+  }
+
+  private estimateLivePnlPct(side: 'LONG' | 'SHORT', entryPrice: number, price: number): number | null {
+    if (!(entryPrice > 0) || !(price > 0)) return null;
+    if (side === 'LONG') {
+      return (price - entryPrice) / entryPrice;
+    }
+    return (entryPrice - price) / entryPrice;
+  }
+
+  private normalizeOrchestratorPnl(value: number | null | undefined): number {
+    const numeric = Number(value ?? 0);
+    if (!Number.isFinite(numeric)) return 0;
+    return numeric / 100;
+  }
+
+  private maybeEmitSoftReduceFallback(
+    symbol: string,
+    event_time_ms: number,
+    metrics: OrchestratorMetricsInput,
+    state: SymbolState,
+    price: number,
+  ): DecisionAction | null {
+    if (!state.position || !(state.position.qty > 0)) return null;
+    const rawUpnl = Number(state.position.unrealizedPnlPct ?? 0);
+    const rawPeakUpnl = Number(state.position.peakPnlPct ?? 0);
+    const deltaZ = Number(metrics.legacyMetrics?.deltaZ ?? 0);
+    const lossPressureReduce = state.execQuality.freezeActive
+      && state.execQuality.quality === 'UNKNOWN'
+      && (state.marginRatio ?? 1) >= this.deps.liquidationEmergencyMarginRatio
+      && rawUpnl < 0
+      && Math.abs(deltaZ) >= 0.8;
+    const severeDrawdownReduce = rawUpnl <= -1;
+    const bufferPct = Math.max(0, Number(this.deps.profitLockBufferBps || 0)) / 10_000;
+    const profitLockReduce = rawPeakUpnl > 0 && this.isNearEntryStop(state.position.side, state.position.entryPrice, price, bufferPct);
+
+    if (!lossPressureReduce && !severeDrawdownReduce && !profitLockReduce) {
+      return null;
+    }
+
+    return {
+      type: 'EXIT_MARKET',
+      symbol,
+      event_time_ms,
+      side: this.toOrderSide(state.position.side === 'LONG' ? 'LONG' : 'SHORT'),
+      quantity: state.position.qty * 0.5,
+      reduceOnly: true,
+      expectedPrice: price,
+      reason: 'REDUCE_SOFT',
+    };
+  }
+
+  private isNearEntryStop(side: 'LONG' | 'SHORT', entryPrice: number, price: number, bufferPct: number): boolean {
+    if (!(entryPrice > 0) || !(price > 0)) return false;
+    if (side === 'LONG') {
+      return price <= entryPrice * (1 + bufferPct);
+    }
+    return price >= entryPrice * (1 - bufferPct);
   }
 
   private toOrderSide(side: StrategySide): 'BUY' | 'SELL' {

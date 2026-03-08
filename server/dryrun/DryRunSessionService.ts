@@ -11,6 +11,8 @@ import { WinnerManager, WinnerState } from './WinnerManager';
 import { AddOnManager } from './AddOnManager';
 import { DryRunClock } from './DryRunClock';
 import { MaterializedSymbolCapitalConfig, SymbolCapitalConfig, materializeSymbolCapitalConfigs, normalizeSymbolCapitalConfigs } from '../types/capital';
+import type { StructureBias, StructureSnapshot, SwingLabel } from '../structure/types';
+import { PositionSizer } from '../position/PositionSizer';
 import path from 'path';
 
 export type DryRunStartupMode = 'EARLY_SEED_THEN_MICRO' | 'WAIT_MICRO_WARMUP';
@@ -91,6 +93,21 @@ export interface DryRunSymbolStatus {
       timeToLiquidationMs: number | null;
       fundingRateImpact: number;
     };
+  };
+  structure: {
+    structureBias: StructureBias;
+    activeZone: {
+      high: number;
+      low: number;
+      mid: number;
+      range: number;
+      timeframe: string;
+      formedAtMs: number;
+    } | null;
+    stopAnchor: number | null;
+    targetBand: number | null;
+    lastSwingLabel: SwingLabel | null;
+    structureFresh: boolean;
   };
   position: {
     side: 'LONG' | 'SHORT';
@@ -244,6 +261,15 @@ type SymbolSession = {
     confidence: number;
     bias15m: 'UP' | 'DOWN' | 'NEUTRAL';
     veto1h: 'NONE' | 'UP' | 'DOWN' | 'EXHAUSTION';
+  };
+  structure: {
+    snapshot: StructureSnapshot | null;
+    structureBias: StructureBias;
+    activeZone: StructureSnapshot['zone'];
+    stopAnchor: number | null;
+    targetBand: number | null;
+    lastSwingLabel: SwingLabel | null;
+    structureFresh: boolean;
   };
   engine: DryRunEngine;
   fundingRate: number;
@@ -493,6 +519,18 @@ function defaultTrendState(): SymbolSession['trend'] {
   };
 }
 
+function defaultStructureState(): SymbolSession['structure'] {
+  return {
+    snapshot: null,
+    structureBias: 'NEUTRAL',
+    activeZone: null,
+    stopAnchor: null,
+    targetBand: null,
+    lastSwingLabel: null,
+    structureFresh: false,
+  };
+}
+
 export class DryRunSessionService {
   private running = false;
   private runId: string | null = null;
@@ -645,6 +683,7 @@ export class DryRunSessionService {
         startedAtMs,
         warmup: defaultWarmupState(),
         trend: defaultTrendState(),
+        structure: defaultStructureState(),
         engine,
         fundingRate,
         lastEventTimestampMs: 0,
@@ -719,6 +758,7 @@ export class DryRunSessionService {
       this.addConsoleLog('INFO', null, 'Dry Run stopped by user.', 0);
     }
     this.running = false;
+    this.tradeLogger?.shutdown();
     return this.getStatus();
   }
 
@@ -730,6 +770,7 @@ export class DryRunSessionService {
     this.sessions.clear();
     this.logTail = [];
     this.consoleSeq = 0;
+    this.tradeLogger?.shutdown();
     return this.getStatus();
   }
 
@@ -749,6 +790,7 @@ export class DryRunSessionService {
         startedAtMs: session.startedAtMs,
         warmup: session.warmup,
         trend: session.trend,
+        structure: session.structure,
         lastState: session.lastState,
         latestMarkPrice: session.latestMarkPrice,
         lastMarkPrice: session.lastMarkPrice,
@@ -835,6 +877,7 @@ export class DryRunSessionService {
         startedAtMs: Number(sessionSnapshot?.startedAtMs || 0),
         warmup: { ...defaultWarmupState(), ...(sessionSnapshot?.warmup || {}) },
         trend: sessionSnapshot?.trend || defaultTrendState(),
+        structure: { ...defaultStructureState(), ...(sessionSnapshot?.structure || {}) },
         engine,
         fundingRate: 0,
         lastEventTimestampMs: sessionSnapshot?.lastEventTimestampMs || 0,
@@ -958,6 +1001,7 @@ export class DryRunSessionService {
     bias15m?: SymbolSession['trend']['bias15m'];
     veto1h?: SymbolSession['trend']['veto1h'];
     vetoReason?: string | null;
+    structure?: StructureSnapshot | null;
   }): void {
     const session = this.sessions.get(normalizeSymbol(symbol));
     if (!session) return;
@@ -1003,6 +1047,9 @@ export class DryRunSessionService {
     if (Number.isFinite(input.trendConfidence as number)) session.trend.confidence = clampNumber(Number(input.trendConfidence), 0, 0, 1);
     if (input.bias15m) session.trend.bias15m = input.bias15m;
     if (input.veto1h) session.trend.veto1h = input.veto1h;
+    if (Object.prototype.hasOwnProperty.call(input, 'structure')) {
+      this.syncStructureRuntimeContext(session, input.structure ?? null);
+    }
   }
 
   private getSessionInitialMarginUsdt(session: SymbolSession): number {
@@ -1184,6 +1231,12 @@ export class DryRunSessionService {
       const position = session.lastState.position;
       const actionSide = action.side || null;
       const desiredOrderSide = actionSide === 'LONG' ? 'BUY' : actionSide === 'SHORT' ? 'SELL' : null;
+      const structureGateReason = this.getStructureActionBlockReason(
+        session,
+        action.type === StrategyActionType.ADD
+          ? 'ADD'
+          : (position && action.type === StrategyActionType.ENTRY && actionSide && position.side === actionSide ? 'ADD' : 'ENTRY')
+      );
       const aiPlan = this.extractAIPlan(action.metadata);
       const aiPolicyAction = Boolean((action.metadata as Record<string, unknown> | undefined)?.aiPolicy) || this.isAIAutonomousRun();
       const strictMeta = this.extractStrictThreeMMeta(action.metadata);
@@ -1196,6 +1249,7 @@ export class DryRunSessionService {
       const addonReady = Boolean(session.warmup.addonReady);
 
       if (action.type === StrategyActionType.ENTRY && desiredOrderSide) {
+        if (structureGateReason) continue;
         if (!tradeReady) {
           continue;
         }
@@ -1255,6 +1309,7 @@ export class DryRunSessionService {
             })
             : this.computeRiskSizing(session, referencePrice, decision.regime, action.sizeMultiplier || 0.5, {
               mode: 'ADD',
+              side: actionSide,
             });
           if (sizing.qty > 0) {
             session.engine.setLeverageOverride(sizing.leverage);
@@ -1296,6 +1351,7 @@ export class DryRunSessionService {
           })
           : this.computeRiskSizing(session, referencePrice, decision.regime, action.sizeMultiplier || 1, {
             mode: 'ENTRY',
+            side: actionSide,
           });
         if (!(sizing.qty > 0)) continue;
         session.engine.setLeverageOverride(sizing.leverage);
@@ -1339,6 +1395,7 @@ export class DryRunSessionService {
       }
 
       if (action.type === StrategyActionType.ADD) {
+        if (structureGateReason) continue;
         if (!addonReady) continue;
         const currentPosition = session.lastState.position;
         if (!currentPosition) continue;
@@ -1352,6 +1409,7 @@ export class DryRunSessionService {
           })
           : this.computeRiskSizing(session, referencePrice, decision.regime, action.sizeMultiplier || 0.5, {
             mode: 'ADD',
+            side: currentPosition.side,
           });
         if (!(sizing.qty > 0)) continue;
         session.engine.setLeverageOverride(sizing.leverage);
@@ -1846,6 +1904,23 @@ export class DryRunSessionService {
           stopLossPrice: session.stopLossPrice ? roundTo(session.stopLossPrice, 6) : null,
           liquidationRisk: this.computeLiquidationRisk(session, symbolMarginHealth),
         },
+        structure: {
+          structureBias: session.structure.structureBias,
+          activeZone: session.structure.activeZone
+            ? {
+              high: roundTo(session.structure.activeZone.high, 8),
+              low: roundTo(session.structure.activeZone.low, 8),
+              mid: roundTo(session.structure.activeZone.mid, 8),
+              range: roundTo(session.structure.activeZone.range, 8),
+              timeframe: session.structure.activeZone.timeframe,
+              formedAtMs: session.structure.activeZone.formedAtMs,
+            }
+            : null,
+          stopAnchor: session.structure.stopAnchor == null ? null : roundTo(session.structure.stopAnchor, 8),
+          targetBand: session.structure.targetBand == null ? null : roundTo(session.structure.targetBand, 8),
+          lastSwingLabel: session.structure.lastSwingLabel,
+          structureFresh: Boolean(session.structure.structureFresh),
+        },
         position: session.lastState.position
           ? {
             side: session.lastState.position.side,
@@ -1938,7 +2013,10 @@ export class DryRunSessionService {
           const pending = session.pendingFlipEntry;
           const referencePrice = pending.candidate?.entryPrice ?? markPrice;
           if (referencePrice > 0) {
-            const sizing = this.computeRiskSizing(session, referencePrice, 'TR');
+            const sizing = this.computeRiskSizing(session, referencePrice, 'TR', 1, {
+              mode: 'ENTRY',
+              side: pending.side === 'BUY' ? 'LONG' : 'SHORT',
+            });
             const qty = roundTo(Math.max(0, sizing.qty), 6);
             session.engine.setLeverageOverride(sizing.leverage);
             if (qty > 0) {
@@ -3105,7 +3183,7 @@ export class DryRunSessionService {
     price: number,
     regime: StrategyRegime,
     sizeMultiplier = 1,
-    options?: { mode?: 'ENTRY' | 'ADD'; incrementalRiskCapPct?: number }
+    options?: { mode?: 'ENTRY' | 'ADD'; incrementalRiskCapPct?: number; side?: StrategySide | null }
   ): { qty: number; leverage: number } {
     if (!this.config || !(price > 0)) return { qty: 0, leverage: session.dynamicLeverage || 1 };
 
@@ -3198,7 +3276,23 @@ export class DryRunSessionService {
       }
     }
 
-    const qty = roundTo(Math.max(0, openingNotional / price), 6);
+    let qty = roundTo(Math.max(0, openingNotional / price), 6);
+    const structureStopPrice = this.resolveStructureStopPriceForSizing(session, options?.side ?? null);
+    if (structureStopPrice != null && structureStopPrice > 0 && qty > 0) {
+      const cappedQty = PositionSizer.calculateQuantity({
+        equity: Math.max(
+          Number(session.lastState.walletBalance || 0),
+          this.getSessionEffectiveReserveUsdt(session),
+          this.getSessionConfiguredReserveUsdt(session),
+        ),
+        riskPerTradePct: this.getRiskPctForRegime(regime),
+        entryPrice: price,
+        stopLossPrice: structureStopPrice,
+      });
+      if (cappedQty > 0) {
+        qty = roundTo(Math.min(qty, cappedQty), 6);
+      }
+    }
     return { qty, leverage };
   }
 
@@ -3604,6 +3698,92 @@ export class DryRunSessionService {
     return Math.max(base, Math.min(0.003, base + trendBonus + atrBonus));
   }
 
+  private syncStructureRuntimeContext(session: SymbolSession, snapshot: StructureSnapshot | null): void {
+    session.structure.snapshot = snapshot;
+    session.structure.structureBias = snapshot?.bias ?? 'NEUTRAL';
+    session.structure.activeZone = snapshot?.zone ?? null;
+    session.structure.lastSwingLabel = snapshot?.lastSwingLabel ?? null;
+    session.structure.structureFresh = Boolean(snapshot?.isFresh);
+
+    const side = this.resolveStructureReferenceSide(session, snapshot);
+    const nextStop = this.resolveStructureStopAnchor(snapshot, side);
+    session.structure.stopAnchor = this.applyMonotonicStructureStop(session.structure.stopAnchor, nextStop, side);
+    session.structure.targetBand = this.resolveStructureTargetBand(snapshot, side);
+  }
+
+  private resolveStructureReferenceSide(
+    session: SymbolSession,
+    snapshot: StructureSnapshot | null,
+  ): StrategySide | null {
+    const positionSide = session.lastState.position?.side;
+    if (positionSide === 'LONG' || positionSide === 'SHORT') return positionSide;
+    if (snapshot?.bias === 'BULLISH') return 'LONG';
+    if (snapshot?.bias === 'BEARISH') return 'SHORT';
+    return null;
+  }
+
+  private resolveStructureStopAnchor(
+    snapshot: StructureSnapshot | null,
+    side: StrategySide | null,
+  ): number | null {
+    if (!snapshot || !side) return null;
+    return side === 'LONG' ? snapshot.anchors.longStopAnchor : snapshot.anchors.shortStopAnchor;
+  }
+
+  private resolveStructureTargetBand(
+    snapshot: StructureSnapshot | null,
+    side: StrategySide | null,
+  ): number | null {
+    if (!snapshot || !side) return null;
+    return side === 'LONG' ? snapshot.anchors.longTargetBand : snapshot.anchors.shortTargetBand;
+  }
+
+  private applyMonotonicStructureStop(
+    previousStop: number | null,
+    nextStop: number | null,
+    side: StrategySide | null,
+  ): number | null {
+    if (nextStop == null || !Number.isFinite(nextStop)) return null;
+    if (previousStop == null || !Number.isFinite(previousStop) || !side) return nextStop;
+    return side === 'LONG'
+      ? Math.max(previousStop, nextStop)
+      : Math.min(previousStop, nextStop);
+  }
+
+  private isStructureRolloutEnabled(): boolean {
+    return ['1', 'true', 'yes', 'on'].includes(String(process.env.STRUCTURE_ENGINE_ENABLED || '').trim().toLowerCase());
+  }
+
+  private getRiskPctForRegime(regime: StrategyRegime): number {
+    if (regime === 'TR') return 0.0035;
+    if (regime === 'EV') return 0.0005;
+    return 0.0025;
+  }
+
+  private resolveStructureStopPriceForSizing(session: SymbolSession, side: StrategySide | null): number | null {
+    if (!this.isStructureRolloutEnabled() || !side) return null;
+    const snapshot = session.structure.snapshot;
+    if (!snapshot || !snapshot.enabled || !snapshot.isFresh) return null;
+    return side === 'LONG' ? snapshot.anchors.longStopAnchor : snapshot.anchors.shortStopAnchor;
+  }
+
+  private getStructureActionBlockReason(
+    session: SymbolSession,
+    mode: 'ENTRY' | 'ADD',
+  ): 'STRUCTURE_MISSING' | 'STRUCTURE_STALE' | 'STRUCTURE_NEUTRAL' | null {
+    if (!this.isStructureRolloutEnabled()) return null;
+    const snapshot = session.structure.snapshot;
+    if (!snapshot || !snapshot.enabled) return 'STRUCTURE_MISSING';
+    if (!snapshot.isFresh) return 'STRUCTURE_STALE';
+    if (snapshot.bias === 'NEUTRAL') return 'STRUCTURE_NEUTRAL';
+    if (mode === 'ADD') {
+      const side = session.lastState.position?.side ?? this.resolveStructureReferenceSide(session, snapshot);
+      if (side === 'LONG' && !snapshot.continuationLong) return 'STRUCTURE_NEUTRAL';
+      if (side === 'SHORT' && !snapshot.continuationShort) return 'STRUCTURE_NEUTRAL';
+    }
+    return null;
+  }
+
   private syncPositionStateAfterEvent(
     session: SymbolSession,
     prevPosition: DryRunStateSnapshot['position'],
@@ -3633,6 +3813,9 @@ export class DryRunSessionService {
       session.flipState.partialReduced = false;
       session.flipState.lastPartialReduceTs = 0;
       session.peakUnrealizedPnlPct = Math.max(0, this.computeUnrealizedPnlPct(session, markPrice));
+      if (session.structure.snapshot) {
+        this.syncStructureRuntimeContext(session, session.structure.snapshot);
+      }
       return;
     }
 
@@ -3649,6 +3832,9 @@ export class DryRunSessionService {
       session.flipState.partialReduced = false;
       session.flipState.lastPartialReduceTs = 0;
       session.peakUnrealizedPnlPct = 0;
+      if (session.structure.snapshot) {
+        this.syncStructureRuntimeContext(session, session.structure.snapshot);
+      }
       return;
     }
 
@@ -3668,6 +3854,9 @@ export class DryRunSessionService {
       session.flipState.partialReduced = false;
       session.flipState.lastPartialReduceTs = 0;
       session.peakUnrealizedPnlPct = Math.max(0, this.computeUnrealizedPnlPct(session, markPrice));
+      if (session.structure.snapshot) {
+        this.syncStructureRuntimeContext(session, session.structure.snapshot);
+      }
       return;
     }
 
@@ -3677,6 +3866,9 @@ export class DryRunSessionService {
         Number.isFinite(session.peakUnrealizedPnlPct) ? session.peakUnrealizedPnlPct : 0,
         currentUnrealizedPnlPct
       );
+      if (session.structure.snapshot) {
+        this.syncStructureRuntimeContext(session, session.structure.snapshot);
+      }
     }
   }
 
