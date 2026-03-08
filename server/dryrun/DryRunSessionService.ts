@@ -2770,6 +2770,47 @@ export class DryRunSessionService {
     session.lastWinnerSignalLogTs = eventTimestampMs;
   }
 
+  private resolveProtectiveClosePrice(
+    session: SymbolSession,
+    side: 'BUY' | 'SELL',
+    fallbackPrice: number,
+  ): number | null {
+    const bestBid = Number(session.lastOrderBook.bids?.[0]?.price || 0);
+    const bestAsk = Number(session.lastOrderBook.asks?.[0]?.price || 0);
+    const touchPrice = side === 'BUY' ? bestAsk : bestBid;
+    const resolved = touchPrice > 0 ? touchPrice : fallbackPrice;
+    return resolved > 0 ? resolved : null;
+  }
+
+  private estimateWinnerStopNetCarry(
+    session: SymbolSession,
+    position: NonNullable<DryRunStateSnapshot['position']>,
+    closeQty: number,
+    closePrice: number,
+  ): { currentNetCarry: number; deltaNet: number; nextNetCarry: number; breakEvenPrice: number | null } {
+    const qty = Math.max(0, Number(closeQty || 0));
+    const price = Math.max(0, Number(closePrice || 0));
+    const trade = session.currentTrade;
+    const currentNetCarry = trade
+      ? Number(trade.pnlRealized || 0) - Number(trade.feeAcc || 0) + Number(trade.fundingAcc || 0)
+      : 0;
+    const configuredFeeRate = Number(this.config?.takerFeeRate ?? DEFAULT_TAKER_FEE_RATE);
+    const feeRate = Number.isFinite(configuredFeeRate)
+      ? clampNumber(configuredFeeRate, DEFAULT_TAKER_FEE_RATE, 0, 0.1)
+      : DEFAULT_TAKER_FEE_RATE;
+    const grossRealized = position.side === 'LONG'
+      ? (price - Number(position.entryPrice || 0)) * qty
+      : (Number(position.entryPrice || 0) - price) * qty;
+    const closeFee = qty * price * feeRate;
+    const deltaNet = grossRealized - closeFee;
+    return {
+      currentNetCarry,
+      deltaNet,
+      nextNetCarry: currentNetCarry + deltaNet,
+      breakEvenPrice: this.computeBreakEvenPrice(session),
+    };
+  }
+
   private maybeEnforceAutonomousWinnerStop(
     session: SymbolSession,
     position: NonNullable<DryRunStateSnapshot['position']>,
@@ -2853,6 +2894,24 @@ export class DryRunSessionService {
     }
 
     const reasonCode: DryRunReasonCode = action === 'TRAIL_STOP' ? 'TRAIL_STOP' : 'PROFITLOCK';
+    const closePrice = this.resolveProtectiveClosePrice(session, closeSide, referencePrice);
+    if (action === 'PROFITLOCK') {
+      if (!(closePrice && closePrice > 0)) {
+        return false;
+      }
+      const netEstimate = this.estimateWinnerStopNetCarry(session, position, sizing.qty, closePrice);
+      if (!(netEstimate.deltaNet > 0) || !(netEstimate.nextNetCarry > 0)) {
+        const breakEvenText = netEstimate.breakEvenPrice != null
+          ? ` breakeven=${roundTo(netEstimate.breakEvenPrice, 4)}`
+          : '';
+        this.maybeLogWinnerStopState(
+          session,
+          eventTimestampMs,
+          `Winner stop suppressed (${action}) net<=0 at touch=${roundTo(closePrice, 4)}${breakEvenText} deltaNet=${roundTo(netEstimate.deltaNet, 4)} nextNet=${roundTo(netEstimate.nextNetCarry, 4)}; ${details}.`
+        );
+        return false;
+      }
+    }
     const order = this.buildAiLimitOrder(session, closeSide, sizing.qty, true, reasonCode);
     if (!order) {
       return false;

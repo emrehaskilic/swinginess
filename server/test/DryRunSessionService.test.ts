@@ -413,6 +413,10 @@ export function runTests() {
   process.env.DRY_RUN_WINNER_STOP_REQUIRE_STRATEGY_CONFIRM = 'false';
   process.env.DRY_RUN_WINNER_STOP_REDUCE_PCT = '0.5';
 
+  const profitableProtectBook = {
+    bids: [{ price: 100.05, qty: 10 }, { price: 100, qty: 10 }],
+    asks: [{ price: 100.15, qty: 10 }, { price: 100.2, qty: 10 }],
+  };
   const winnerProtectSvc = new DryRunSessionService();
   winnerProtectSvc.start({
     symbols: ['BTCUSDT'],
@@ -423,8 +427,8 @@ export function runTests() {
     heartbeatIntervalMs: 1000,
   });
   const winnerProtectSession = (winnerProtectSvc as any).sessions.get('BTCUSDT');
-  winnerProtectSession.lastOrderBook = baseBook;
-  winnerProtectSession.latestMarkPrice = 100.8;
+  winnerProtectSession.lastOrderBook = profitableProtectBook;
+  winnerProtectSession.latestMarkPrice = 100.1;
   winnerProtectSession.lastState = {
     ...winnerProtectSession.lastState,
     walletBalance: 5000,
@@ -442,14 +446,14 @@ export function runTests() {
     side: 'LONG',
     rDistance: 1,
     maxFavorablePrice: 103,
-    profitLockStop: 101,
+    profitLockStop: 100.12,
     trailingStop: null,
     lockedR: 1,
     stopBreachTicks: 3,
   };
   const protectiveOrders = (winnerProtectSvc as any).buildDeterministicOrders(
     winnerProtectSession,
-    100.8,
+    100.1,
     1_700_000_007_000
   );
   assert(protectiveOrders.length === 1, 'autonomous profit lock should queue a protective order');
@@ -457,6 +461,51 @@ export function runTests() {
   assert(protectiveOrders[0].reduceOnly === true, 'profit lock enforcement must stay reduce-only');
   assert(protectiveOrders[0].qty === 5, 'profit lock enforcement should partial-reduce by default');
   assert(winnerProtectSession.pendingExitReason == null, 'partial profit lock reduce must not pre-label the whole trade as exited');
+
+  const suppressedProtectSvc = new DryRunSessionService();
+  suppressedProtectSvc.start({
+    symbols: ['BTCUSDT'],
+    walletBalanceStartUsdt: 5000,
+    initialMarginUsdt: 500,
+    leverage: 10,
+    fundingRate: 0,
+    heartbeatIntervalMs: 1000,
+  });
+  const suppressedProtectSession = (suppressedProtectSvc as any).sessions.get('BTCUSDT');
+  suppressedProtectSession.lastOrderBook = baseBook;
+  suppressedProtectSession.latestMarkPrice = 100.8;
+  suppressedProtectSession.lastState = {
+    ...suppressedProtectSession.lastState,
+    walletBalance: 5000,
+    position: {
+      side: 'LONG',
+      qty: 10,
+      entryPrice: 100,
+      entryTimestampMs: 1_700_000_006_000,
+    },
+    openLimitOrders: [],
+    marginHealth: 1,
+  };
+  suppressedProtectSession.winnerState = {
+    entryPrice: 100,
+    side: 'LONG',
+    rDistance: 1,
+    maxFavorablePrice: 103,
+    profitLockStop: 101,
+    trailingStop: null,
+    lockedR: 1,
+    stopBreachTicks: 3,
+  };
+  const suppressedProtectiveOrders = (suppressedProtectSvc as any).buildDeterministicOrders(
+    suppressedProtectSession,
+    100.8,
+    1_700_000_007_500
+  );
+  assert(suppressedProtectiveOrders.length === 0, 'profit lock should be suppressed when touch-price execution is net negative');
+  assert(
+    suppressedProtectSvc.getStatus().logTail.some((l) => l.message.includes('Winner stop suppressed (PROFITLOCK)')),
+    'suppressed profit lock should emit an explicit diagnostic log'
+  );
 
   const winnerTrailSvc = new DryRunSessionService();
   winnerTrailSvc.start({
@@ -728,6 +777,7 @@ export function runTests() {
   reduceCooldownSvc.stop();
   peakTrackingSvc.stop();
   winnerProtectSvc.stop();
+  suppressedProtectSvc.stop();
   winnerTrailSvc.stop();
   winnerDeferredSvc.stop();
   structureSvc.stop();
