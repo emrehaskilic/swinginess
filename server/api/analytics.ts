@@ -395,23 +395,48 @@ export function createAnalyticsRoutes(options: AnalyticsRoutesOptions): Router {
   router.get('/pnl', (_req: Request, res: Response) => {
     try {
       const snapshot = analyticsEngine.getSnapshot();
+      const dryRunStatus = getDryRunStatus ? getDryRunStatus() : null;
+      const dryRunFallback = deriveDryRunFallback(dryRunStatus);
+      const useFallback = Boolean(
+        dryRunFallback &&
+        snapshot.summary.totalTrades === 0 &&
+        (
+          dryRunFallback.totalTrades > 0 ||
+          dryRunFallback.openPositions > 0 ||
+          Math.abs(dryRunFallback.totalRealizedPnl) > 0 ||
+          Math.abs(dryRunFallback.unrealizedPnl) > 0 ||
+          dryRunFallback.totalFees > 0
+        ),
+      );
+
+      const totalRealizedPnl = useFallback ? dryRunFallback!.totalRealizedPnl : snapshot.summary.totalRealizedPnl;
+      const totalFees = useFallback ? dryRunFallback!.totalFees : snapshot.summary.totalFees;
+      const unrealizedPnl = useFallback ? dryRunFallback!.unrealizedPnl : snapshot.summary.unrealizedPnl;
+      const netPnl = useFallback ? dryRunFallback!.netPnl : snapshot.summary.netPnl;
+      const positions = useFallback ? dryRunFallback!.positions : (snapshot.positions || []);
+      const bySymbol = useFallback ? dryRunFallback!.bySymbol : snapshot.bySymbol;
+
+      // For fallback: all fees are taker (dry run uses market orders)
       const evidencePack = analyticsEngine.generateEvidencePack();
       const feeBreakdowns = evidencePack?.pnl?.fees || [];
-      const makerFees = feeBreakdowns.reduce((sum, fee) => sum + Number(fee?.makerFees || 0), 0);
-      const takerFees = feeBreakdowns.reduce((sum, fee) => sum + Number(fee?.takerFees || 0), 0);
+      const engineMakerFees = feeBreakdowns.reduce((sum, fee) => sum + Number(fee?.makerFees || 0), 0);
+      const engineTakerFees = feeBreakdowns.reduce((sum, fee) => sum + Number(fee?.takerFees || 0), 0);
+      const makerFees = useFallback ? 0 : engineMakerFees;
+      const takerFees = useFallback ? totalFees : engineTakerFees;
+
       res.status(200).json({
         timestamp: Date.now(),
         pnl: {
-          totalRealizedPnl: snapshot.summary.totalRealizedPnl,
-          totalFees: snapshot.summary.totalFees,
-          netPnl: snapshot.summary.netPnl,
-          unrealizedPnl: snapshot.summary.unrealizedPnl,
+          totalRealizedPnl,
+          totalFees,
+          netPnl,
+          unrealizedPnl,
           makerFees,
           takerFees,
           totalReturn: 0,
         },
-        positions: snapshot.positions || [],
-        bySymbol: snapshot.bySymbol,
+        positions,
+        bySymbol,
       });
     } catch (error: any) {
       res.status(500).json({
@@ -424,21 +449,46 @@ export function createAnalyticsRoutes(options: AnalyticsRoutesOptions): Router {
   router.get('/trades', (_req: Request, res: Response) => {
     try {
       const snapshot = analyticsEngine.getSnapshot();
+      const dryRunStatus = getDryRunStatus ? getDryRunStatus() : null;
+      const dryRunFallback = deriveDryRunFallback(dryRunStatus);
+      const useFallback = Boolean(
+        dryRunFallback &&
+        snapshot.summary.totalTrades === 0 &&
+        (
+          dryRunFallback.totalTrades > 0 ||
+          dryRunFallback.openPositions > 0 ||
+          Math.abs(dryRunFallback.totalRealizedPnl) > 0 ||
+          Math.abs(dryRunFallback.unrealizedPnl) > 0
+        ),
+      );
+
+      const totalTrades = useFallback ? dryRunFallback!.totalTrades : snapshot.summary.totalTrades;
+      const openPositions = useFallback ? dryRunFallback!.openPositions : snapshot.summary.openPositions;
+      const winningTrades = useFallback ? dryRunFallback!.winningTrades : snapshot.summary.winningTrades;
+      const losingTrades = useFallback ? dryRunFallback!.losingTrades : snapshot.summary.losingTrades;
+      const winRate = useFallback ? dryRunFallback!.winRate : snapshot.summary.winRate;
+      const avgWin = useFallback ? dryRunFallback!.avgWin : snapshot.summary.avgWin;
+      const avgLoss = useFallback ? dryRunFallback!.avgLoss : snapshot.summary.avgLoss;
+      const avgTradePnl = useFallback ? dryRunFallback!.avgTradePnl : snapshot.summary.avgTradePnl;
+      const avgReturnPerTradePct = useFallback ? dryRunFallback!.avgReturnPerTradePct : snapshot.summary.avgReturnPerTradePct;
+      const profitFactor = useFallback ? dryRunFallback!.profitFactor : snapshot.summary.profitFactor;
+      const positions = useFallback ? dryRunFallback!.positions : (snapshot.positions || []);
+
       res.status(200).json({
         timestamp: Date.now(),
         trades: {
-          totalTrades: snapshot.summary.totalTrades,
-          openPositions: snapshot.summary.openPositions,
-          winningTrades: snapshot.summary.winningTrades,
-          losingTrades: snapshot.summary.losingTrades,
-          winRate: snapshot.summary.winRate,
-          avgWin: snapshot.summary.avgWin,
-          avgLoss: snapshot.summary.avgLoss,
-          avgTradePnl: snapshot.summary.avgTradePnl,
-          avgReturnPerTradePct: snapshot.summary.avgReturnPerTradePct,
-          profitFactor: snapshot.summary.profitFactor,
+          totalTrades,
+          openPositions,
+          winningTrades,
+          losingTrades,
+          winRate,
+          avgWin,
+          avgLoss,
+          avgTradePnl,
+          avgReturnPerTradePct,
+          profitFactor,
         },
-        positions: snapshot.positions || [],
+        positions,
       });
     } catch (error: any) {
       res.status(500).json({
@@ -451,15 +501,33 @@ export function createAnalyticsRoutes(options: AnalyticsRoutesOptions): Router {
   router.get('/drawdown', (_req: Request, res: Response) => {
     try {
       const snapshot = analyticsEngine.getSnapshot();
+      const dryRunStatus = getDryRunStatus ? getDryRunStatus() : null;
+      const dryRunFallback = deriveDryRunFallback(dryRunStatus);
+      const useFallback = Boolean(
+        dryRunFallback &&
+        snapshot.summary.totalTrades === 0 &&
+        (dryRunFallback.totalTrades > 0 || dryRunFallback.openPositions > 0),
+      );
+
+      // Use start balance as denominator so percentage is always relative to initial capital
+      const startBalance = Math.max(1, Number(
+        dryRunStatus?.config?.sharedWalletStartUsdt ||
+        dryRunStatus?.config?.walletBalanceStartUsdt ||
+        10000,
+      ));
+
+      const maxDrawdown = useFallback ? dryRunFallback!.maxDrawdown : snapshot.drawdown.maxDrawdown;
+      const currentDrawdown = useFallback ? dryRunFallback!.currentDrawdown : snapshot.drawdown.currentDrawdown;
+      const maxDrawdownPercent = Math.min(100, Math.max(0, (maxDrawdown / startBalance) * 100));
+      const currentDrawdownPercent = Math.min(100, Math.max(0, (currentDrawdown / startBalance) * 100));
+
       res.status(200).json({
         timestamp: Date.now(),
         drawdown: {
-          maxDrawdown: snapshot.drawdown.maxDrawdown,
-          maxDrawdownPercent: snapshot.drawdown.maxDrawdownPercent,
-          currentDrawdown: snapshot.drawdown.currentDrawdown,
-          currentDrawdownPercent: Number(snapshot.drawdown.peakEquity || 0) !== 0
-            ? (snapshot.drawdown.currentDrawdown / Math.max(1e-9, Math.abs(Number(snapshot.drawdown.peakEquity || 0)))) * 100
-            : 0,
+          maxDrawdown,
+          maxDrawdownPercent,
+          currentDrawdown,
+          currentDrawdownPercent,
           recoveryFactor: Number(snapshot.drawdown.recoveryTimeMs ?? 0),
         },
       });
