@@ -382,6 +382,10 @@ export interface StrategyConfig {
   edgeSizingEnabled: boolean;
   edgeSizeFloorMultiplier: number;
   edgeSizeCeilMultiplier: number;
+  atrStopMultiplier?: number;
+  atrStopMin?: number;
+  atrStopMax?: number;
+  targetVolPct?: number;
 }
 
 export const defaultStrategyConfig: StrategyConfig = {

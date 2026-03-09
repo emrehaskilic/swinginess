@@ -403,6 +403,16 @@ export class NewStrategyV11 {
     if (this.shouldBlockEntryByDecisionContext(input)) {
       return null;
     }
+    // MR regime: require stronger microstructure conviction to avoid whipsaw
+    if (regime === 'MR') {
+      const obiW = input.market.obiWeighted;
+      const deltaZ = input.market.deltaZ;
+      const longOk = obiW > 0.15 && deltaZ > 1.5 && dfsP > 0.75;
+      const shortOk = obiW < -0.15 && deltaZ < -1.5 && dfsP < 0.25;
+      if ((desiredSide === 'LONG' && !longOk) || (desiredSide === 'SHORT' && !shortOk)) {
+        return null;
+      }
+    }
     const setupKind = this.resolveEntrySetupKind(input, desiredSide);
     if (setupKind === 'BREAKOUT_ACCEPTANCE') {
       return this.allowBreakoutAcceptanceEntry(input, desiredSide, dfsP, thresholds) ? setupKind : null;
@@ -652,7 +662,8 @@ export class NewStrategyV11 {
     if (setupKind === 'BREAKOUT_ACCEPTANCE') multiplier += 0.05;
     if (context.execution.quality === 'DEGRADED') multiplier *= 0.9;
     if (context.manipulation.risk === 'MEDIUM') multiplier *= 0.9;
-    return clamp(multiplier, floor, ceil);
+    const volNorm = this.getVolNormMultiplier(input);
+    return clamp(multiplier * volNorm, floor, ceil);
   }
 
   private isEarlySeedPhase(input: StrategyInput): boolean {
@@ -769,7 +780,7 @@ export class NewStrategyV11 {
     const peakPnlPct = this.getPeakPnlPct(input);
     const givebackPct = this.getProfitGivebackPct(input);
     const carryReduceArmed = peakPnlPct >= this.getTrendCarryReduceMinPeakPnlPct();
-    const carryReduceTriggered = carryReduceArmed && givebackPct >= this.getTrendCarryReduceGivebackPct();
+    const carryReduceTriggered = carryReduceArmed && givebackPct >= this.getVolAdjustedGivebackPct(this.getTrendCarryReduceGivebackPct(), input);
     const structureInvalidation = this.isStructureInvalidated(input, side);
     const context = this.getDecisionContext(input);
     const stillHoldingTrendWinner = trendAligned
@@ -844,6 +855,19 @@ export class NewStrategyV11 {
     }
 
     if (trendAligned && positionAgeMs < DEFAULT_TREND_CARRY_PROTECT_MS) {
+      // After 3 minutes, allow early soft-reduce if structure is breaking (hard exit still locked)
+      if (this.isTrendCarryEarlyStructureBreaking(input, side)) {
+        this.lastSoftReduceTs = input.nowMs;
+        this.lastSoftReduceSide = side;
+        return {
+          type: StrategyActionType.REDUCE,
+          side,
+          reason: 'REDUCE_SOFT',
+          reducePct: 0.4,
+          expectedPrice: input.market.price,
+          metadata: { mode: 'TREND_CARRY_EARLY_STRUCTURE_BREAK', positionAgeMs },
+        };
+      }
       return null;
     }
 
@@ -906,9 +930,7 @@ export class NewStrategyV11 {
     const trendAligned = this.isTrendAligned(side, bias15m, veto1h);
     const htfOpposes = this.isHtfOpposing(side, bias15m, veto1h);
     const vwapHoldTicks = this.config.hardRevTicks;
-    const configuredMaxLossPct = Number.isFinite(this.config.maxLossPct as number)
-      ? Math.min(-0.0001, Number(this.config.maxLossPct))
-      : -0.02;
+    const configuredMaxLossPct = this.getDynamicStopLossPct(input);
     const hasDefensiveAddCapacity = Boolean(this.config.defensiveAddEnabled)
       && input.position.addsUsed < this.config.addSizing.length;
     const stopLossThreshold = hasDefensiveAddCapacity
@@ -918,7 +940,7 @@ export class NewStrategyV11 {
     const peakPnlPct = this.getPeakPnlPct(input);
     const givebackPct = this.getProfitGivebackPct(input);
     const carryHardExitArmed = peakPnlPct >= this.getTrendCarryHardExitMinPeakPnlPct();
-    const carryHardExitTriggered = carryHardExitArmed && givebackPct >= this.getTrendCarryHardExitGivebackPct();
+    const carryHardExitTriggered = carryHardExitArmed && givebackPct >= this.getVolAdjustedGivebackPct(this.getTrendCarryHardExitGivebackPct(), input);
     const confirmedTrendExit = this.hasConfirmedTrendExitContext(input, side);
     const structureInvalidation = this.isStructureInvalidated(input, side);
     const context = this.getDecisionContext(input);
@@ -1303,6 +1325,60 @@ export class NewStrategyV11 {
     const configured = Number(this.config.freshExitOverrideLossPct);
     if (Number.isFinite(configured) && configured < 0) return configured;
     return DEFAULT_FRESH_EXIT_OVERRIDE_LOSS_PCT;
+  }
+
+  private getDynamicStopLossPct(input: StrategyInput): number {
+    const base = Number.isFinite(this.config.maxLossPct as number)
+      ? Math.min(-0.0001, Number(this.config.maxLossPct))
+      : -0.02;
+    const price = Number(input.market.price || 0);
+    const atr = Number(input.volatility || 0);
+    if (price <= 0 || atr <= 0) return base;
+    const atrPct = atr / price;
+    const multiplier = Number.isFinite(Number(this.config.atrStopMultiplier)) && Number(this.config.atrStopMultiplier) > 0
+      ? Number(this.config.atrStopMultiplier)
+      : 1.5;
+    const atrMin = Number.isFinite(Number(this.config.atrStopMin)) && Number(this.config.atrStopMin) > 0
+      ? Number(this.config.atrStopMin)
+      : 0.008;
+    const atrMax = Number.isFinite(Number(this.config.atrStopMax)) && Number(this.config.atrStopMax) > 0
+      ? Number(this.config.atrStopMax)
+      : 0.020;
+    return -(clamp(atrPct * multiplier, atrMin, atrMax));
+  }
+
+  private getVolAdjustedGivebackPct(base: number, input: StrategyInput): number {
+    const price = Number(input.market.price || 0);
+    const atr = Number(input.volatility || 0);
+    if (price <= 0 || atr <= 0) return base;
+    const atrPct = atr / price;
+    // Reference: 0.5% ATR per bar = normal crypto volatility
+    // Below 0.5%: tighter giveback; above 0.5%: wider giveback
+    const REF_ATR_PCT = 0.005;
+    return base * clamp(atrPct / REF_ATR_PCT, 0.5, 2.5);
+  }
+
+  private getVolNormMultiplier(input: StrategyInput): number {
+    const price = Number(input.market.price || 0);
+    const atr = Number(input.volatility || 0);
+    if (price <= 0 || atr <= 0) return 1.0;
+    const atrPct = atr / price;
+    const target = Number.isFinite(Number(this.config.targetVolPct)) && Number(this.config.targetVolPct) > 0
+      ? Number(this.config.targetVolPct)
+      : 0.003;
+    return clamp(target / atrPct, 0.5, 1.5);
+  }
+
+  private isTrendCarryEarlyStructureBreaking(input: StrategyInput, side: StrategySide): boolean {
+    const ageMs = this.getPositionAgeMs(input);
+    if (ageMs === null) return false;
+    if (ageMs < 3 * 60_000) return false;
+    if (ageMs >= this.getTrendCarryMinHoldMs()) return false;
+    if (!this.isAlignedTrendState(side, this.getRuntimeTrendState(input))) return false;
+    if (this.isStructureInvalidated(input, side)) return true;
+    const bias15m = this.bias15m(input);
+    const veto1h = this.veto1h(input);
+    return this.isHtfOpposing(side, bias15m, veto1h);
   }
 
   private getTrendCarryReduceMinPeakPnlPct(): number {
