@@ -69,6 +69,15 @@ export class NewStrategyV11 {
   private adverseTrendBuckets = 0;
   private neutralTrendBuckets = 0;
 
+  // Scale-out state: tracks partial stops and breakeven arm per position
+  // Keyed by `${symbol}:${entryPrice}` — resets automatically when a new position opens
+  private scaleOutState = new Map<string, {
+    stop1Used: boolean;
+    stop2Used: boolean;
+    breakevenArmed: boolean;
+    entryPrice: number;
+  }>();
+
   constructor(config?: Partial<StrategyConfig>, decisionLog?: DecisionLog) {
     this.config = { ...defaultStrategyConfig, ...(config || {}) };
     const windowMs = Math.max(60_000, this.config.rollingWindowMin * 60_000);
@@ -945,6 +954,33 @@ export class NewStrategyV11 {
     const structureInvalidation = this.isStructureInvalidated(input, side);
     const context = this.getDecisionContext(input);
     const confirmedOppositePressure = this.adverseTrendBuckets >= this.getTrendExitConfirmBars();
+
+    // --- Scale-out state (per position, resets on new entry) ---
+    const scaleState = this.getOrResetScaleOutState(
+      input.symbol,
+      input.position.entryPrice,
+    );
+
+    // Katman 2: Breakeven stop — arm when position peaks >= +0.5%, exit if it falls back to 0%
+    if (!scaleState.breakevenArmed && peakPnlPct >= 0.005) {
+      scaleState.breakevenArmed = true;
+    }
+    if (scaleState.breakevenArmed && unrealizedPnlPct <= 0) {
+      return {
+        type: StrategyActionType.EXIT,
+        side,
+        reason: 'EXIT_BREAKEVEN_STOP',
+        expectedPrice: price,
+        metadata: { unrealizedPnlPct, peakPnlPct, breakevenArmed: true },
+      };
+    }
+
+    // Katman 1: Kademeli stop (scale-out) — partial reduces before full stop
+    // partialStop1 = 50% of full stop (e.g. -0.6% when full stop is -1.2%)
+    // partialStop2 = 75% of full stop (e.g. -0.9% when full stop is -1.2%)
+    const partialStop1Pct = stopLossThreshold * 0.5;
+    const partialStop2Pct = stopLossThreshold * 0.75;
+
     if (unrealizedPnlPct <= stopLossThreshold) {
       return {
         type: StrategyActionType.EXIT,
@@ -959,9 +995,51 @@ export class NewStrategyV11 {
         },
       };
     }
+    if (unrealizedPnlPct <= partialStop2Pct && !scaleState.stop2Used) {
+      scaleState.stop2Used = true;
+      return {
+        type: StrategyActionType.REDUCE,
+        side,
+        reason: 'REDUCE_PARTIAL_STOP_2',
+        reducePct: 0.35,
+        expectedPrice: price,
+        metadata: { unrealizedPnlPct, partialStop2Pct, stopLossThreshold },
+      };
+    }
+    if (unrealizedPnlPct <= partialStop1Pct && !scaleState.stop1Used) {
+      scaleState.stop1Used = true;
+      return {
+        type: StrategyActionType.REDUCE,
+        side,
+        reason: 'REDUCE_PARTIAL_STOP_1',
+        reducePct: 0.40,
+        expectedPrice: price,
+        metadata: { unrealizedPnlPct, partialStop1Pct, stopLossThreshold },
+      };
+    }
     if (this.isTrendCarryHoldLocked(input, side) && !confirmedTrendExit) {
       return null;
     }
+
+    // Katman 3: Time-based flat exit — 30 min with no meaningful profit AND no trend alignment
+    // Exit to free capital from stalled positions. Only fires when not trend-aligned.
+    const FLAT_EXIT_MS = 30 * 60 * 1000;
+    const FLAT_THRESHOLD_PCT = 0.002; // within ±0.2% of entry = "flat"
+    if (
+      positionAgeMs >= FLAT_EXIT_MS
+      && Math.abs(unrealizedPnlPct) <= FLAT_THRESHOLD_PCT
+      && !trendAligned
+      && !carryHardExitArmed
+    ) {
+      return {
+        type: StrategyActionType.EXIT,
+        side,
+        reason: 'EXIT_HARD',
+        expectedPrice: price,
+        metadata: { mode: 'TIME_FLAT_EXIT', positionAgeMs, unrealizedPnlPct },
+      };
+    }
+
     if (this.shouldProtectFreshExit(input, dfsP, thresholds)) {
       return null;
     }
@@ -1325,6 +1403,21 @@ export class NewStrategyV11 {
     const configured = Number(this.config.freshExitOverrideLossPct);
     if (Number.isFinite(configured) && configured < 0) return configured;
     return DEFAULT_FRESH_EXIT_OVERRIDE_LOSS_PCT;
+  }
+
+  private getOrResetScaleOutState(symbol: string, entryPrice: number) {
+    const key = `${symbol}:${entryPrice.toFixed(8)}`;
+    let state = this.scaleOutState.get(key);
+    if (!state || state.entryPrice !== entryPrice) {
+      // New position opened — reset all partial stop flags
+      state = { stop1Used: false, stop2Used: false, breakevenArmed: false, entryPrice };
+      // Clean up stale keys for the same symbol
+      for (const k of this.scaleOutState.keys()) {
+        if (k.startsWith(`${symbol}:`)) this.scaleOutState.delete(k);
+      }
+      this.scaleOutState.set(key, state);
+    }
+    return state;
   }
 
   private getDynamicStopLossPct(input: StrategyInput): number {
