@@ -354,7 +354,7 @@ const DEFAULT_STOP_ATR_MULT = Number(process.env.DRY_RUN_STOP_ATR_MULT || 1.4);
 const DEFAULT_STOP_MIN_DIST = Number(process.env.DRY_RUN_STOP_MIN_DIST || 0.5);
 const DEFAULT_ATR_WINDOW = Number(process.env.DRY_RUN_ATR_WINDOW || 14);
 const DEFAULT_LARGE_LOSS_ALERT = Number(process.env.DRY_RUN_LARGE_LOSS_USDT || 500);
-const DEFAULT_LIMIT_STRATEGY = String(process.env.DRY_RUN_LIMIT_STRATEGY || 'MARKET').toUpperCase();
+const DEFAULT_LIMIT_STRATEGY = String(process.env.DRY_RUN_LIMIT_STRATEGY || 'PASSIVE').toUpperCase();
 const DEFAULT_PERF_SAMPLE_MS = Number(process.env.DRY_RUN_PERF_SAMPLE_MS || 2000);
 const DEFAULT_TRADE_LOG_ENABLED = String(process.env.DRY_RUN_TRADE_LOGS || 'true').toLowerCase();
 const DEFAULT_SERVER_ROOT = path.basename(process.cwd()).toLowerCase() === 'server'
@@ -2619,6 +2619,32 @@ export class DryRunSessionService {
     const bestBid = Number(session.lastOrderBook.bids?.[0]?.price || 0);
     const bestAsk = Number(session.lastOrderBook.asks?.[0]?.price || 0);
     const mark = Number(session.latestMarkPrice || 0);
+
+    // Soft reduces (profit-lock, giveback) use passive GTC limit → maker fee (0.02%)
+    // Hard exits (stop-loss, force-exit) stay IOC → taker fee but guaranteed fill
+    const isSoftReduce = reasonCode === 'STRAT_REDUCE';
+    if (isSoftReduce && (bestBid > 0 || bestAsk > 0)) {
+      // Join the spread: for SELL join bestAsk, for BUY join bestBid → passive maker
+      const passivePrice = side === 'SELL'
+        ? (bestAsk > 0 ? bestAsk : mark)
+        : (bestBid > 0 ? bestBid : mark);
+      if (passivePrice > 0) {
+        const ttlMs = Math.max(250, Math.trunc(clampNumber(process.env.LIMIT_TTL_MS, 4000, 250, 10_000)));
+        return {
+          side,
+          type: 'LIMIT',
+          qty: roundTo(qty, 6),
+          price: roundTo(passivePrice, 6),
+          timeInForce: 'GTC',
+          reduceOnly,
+          postOnly: false,
+          ttlMs,
+          reasonCode,
+        };
+      }
+    }
+
+    // Aggressive IOC for hard exits — guaranteed fill, taker fee acceptable
     let price = side === 'BUY' ? bestAsk : bestBid;
     if (!(price > 0)) {
       price = mark;
