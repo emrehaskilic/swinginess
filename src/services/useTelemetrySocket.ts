@@ -39,8 +39,8 @@ export function useTelemetrySocket(
     // Stale detection: after first metrics received, reconnect if silent for >15s
     let staleMetricsTimer: number | null = null;
     const maxDelayMs = 30_000;
-    const noMetricsTimeoutMs = 10_000;
-    const staleMetricsTimeoutMs = 15_000;
+    const noMetricsTimeoutMs = 20_000;
+    const staleMetricsTimeoutMs = 30_000;
     reconnectAttempts.current = 0;
     const wsCandidates = getProxyWsCandidates();
 
@@ -69,7 +69,7 @@ export function useTelemetrySocket(
       clearStaleMetricsTimer();
       staleMetricsTimer = window.setTimeout(() => {
         if (disposed || wsRef.current !== ws) return;
-        console.warn('[Telemetry] No metrics for 15s — reconnecting (stale detection)');
+        console.warn('[Telemetry] No metrics for 30s — reconnecting (stale detection)');
         try { ws.close(4001, 'stale_metrics'); } catch { /* ignore */ }
       }, staleMetricsTimeoutMs);
     };

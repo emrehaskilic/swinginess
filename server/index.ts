@@ -4678,6 +4678,22 @@ setInterval(() => {
     }
 }, METRICS_HEARTBEAT_INTERVAL_MS);
 
+// Independent risk-engine heartbeat: keep kill switch alive as long as Binance WS is connected.
+// This decouples the kill switch from metric broadcast frequency — even if markets are quiet
+// or broadcastMetrics is throttled, the kill switch won't fire a false "Connection lost" alarm.
+const RISK_HEARTBEAT_INTERVAL_MS = 15_000; // every 15s — well within the 90s disconnect timeout
+setInterval(() => {
+    if (!RISK_ENGINE_ENABLED) return;
+    if (wsState !== 'connected') return;
+    // WS is connected → feed the kill switch timer so it doesn't expire
+    institutionalRiskEngine.recordHeartbeat(Date.now());
+    // Auto-recover: if WS is connected but kill switch is still active from a stale disconnect,
+    // clear it so metrics and trading resume automatically.
+    if (KILL_SWITCH && institutionalRiskEngine.getRiskState() === RiskState.KILL_SWITCH) {
+        maybeRecoverDisconnectKillSwitch('heartbeat_auto_recovery');
+    }
+}, RISK_HEARTBEAT_INTERVAL_MS);
+
 // Reset 10s counters
 setInterval(() => {
     const now = Date.now();
