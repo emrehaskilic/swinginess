@@ -1106,13 +1106,39 @@ function getOrderbook(symbol: string): OrderbookState {
     return getOrCreateOrderbookState(orderbookMap, symbol);
 }
 
+/**
+ * Prune expired entries from a timestamp array.
+ * Uses binary search + splice instead of repeated shift() to avoid O(n²) degradation.
+ * Also caps array size to prevent unbounded growth between prune cycles.
+ */
 function pruneWindow(values: number[], windowMs: number, now: number): void {
-    while (values.length > 0 && now - values[0] > windowMs) {
-        values.shift();
+    if (values.length === 0) return;
+    const cutoff = now - windowMs;
+    if (values[values.length - 1] <= cutoff) {
+        // All entries are expired — fastest path
+        values.length = 0;
+        return;
     }
+    if (values[0] > cutoff) return; // nothing to prune
+
+    // Binary search for the first entry within the window
+    let lo = 0, hi = values.length - 1;
+    while (lo < hi) {
+        const mid = (lo + hi) >>> 1;
+        if (values[mid] <= cutoff) lo = mid + 1;
+        else hi = mid;
+    }
+    // Remove all entries before 'lo' in one operation (O(n) splice vs O(n²) repeated shift)
+    if (lo > 0) values.splice(0, lo);
 }
 
+const MAX_EVENT_ARRAY_SIZE = 500; // hard cap to prevent unbounded growth
+
 function countWindow(values: number[], windowMs: number, now: number): number {
+    // Hard cap: if array exceeded max size, truncate from the front immediately
+    if (values.length > MAX_EVENT_ARRAY_SIZE) {
+        values.splice(0, values.length - MAX_EVENT_ARRAY_SIZE);
+    }
     pruneWindow(values, windowMs, now);
     return values.length;
 }
@@ -1183,16 +1209,34 @@ function recordLiveSample(symbol: string, live: boolean): void {
     const meta = getMeta(symbol);
     const now = Date.now();
     meta.liveSamples.push({ ts: now, live });
-    while (meta.liveSamples.length > 0 && now - meta.liveSamples[0].ts > 60000) {
-        meta.liveSamples.shift();
+    // Efficient pruning: binary search + splice instead of repeated shift()
+    const cutoff = now - 60000;
+    if (meta.liveSamples.length > 0 && meta.liveSamples[0].ts <= cutoff) {
+        let lo = 0, hi = meta.liveSamples.length - 1;
+        while (lo < hi) {
+            const mid = (lo + hi) >>> 1;
+            if (meta.liveSamples[mid].ts <= cutoff) lo = mid + 1;
+            else hi = mid;
+        }
+        if (lo > 0) meta.liveSamples.splice(0, lo);
     }
+    // Hard cap to prevent unbounded growth
+    if (meta.liveSamples.length > 120) meta.liveSamples.splice(0, meta.liveSamples.length - 120);
 }
 
 function liveUptimePct60s(symbol: string): number {
     const meta = getMeta(symbol);
     const now = Date.now();
-    while (meta.liveSamples.length > 0 && now - meta.liveSamples[0].ts > 60000) {
-        meta.liveSamples.shift();
+    // Efficient pruning: binary search + splice instead of repeated shift()
+    const cutoff = now - 60000;
+    if (meta.liveSamples.length > 0 && meta.liveSamples[0].ts <= cutoff) {
+        let lo = 0, hi = meta.liveSamples.length - 1;
+        while (lo < hi) {
+            const mid = (lo + hi) >>> 1;
+            if (meta.liveSamples[mid].ts <= cutoff) lo = mid + 1;
+            else hi = mid;
+        }
+        if (lo > 0) meta.liveSamples.splice(0, lo);
     }
     if (meta.liveSamples.length === 0) {
         return 0;
@@ -1246,6 +1290,7 @@ function requestOrderbookResync(symbol: string, trigger: string, detail: any = {
     meta.goodSequenceStreak = 0;
     meta.desyncCount += 1;
     meta.desyncEvents.push(now);
+    if (meta.desyncEvents.length > MAX_EVENT_ARRAY_SIZE) meta.desyncEvents.splice(0, meta.desyncEvents.length - MAX_EVENT_ARRAY_SIZE);
 
     const queueSizeBefore = meta.depthQueue.length + meta.eventQueue.getQueueLength();
     resetRealtimeSymbolState(symbol, `resync:${trigger}`);
@@ -1421,6 +1466,7 @@ async function fetchSnapshot(symbol: string, trigger: string, force = false) {
     const waitMs = Math.max(SNAPSHOT_MIN_INTERVAL_MS, meta.backoffMs);
     if (!force && now - meta.lastSnapshotAttempt < waitMs) {
         meta.snapshotSkipEvents.push(now);
+        if (meta.snapshotSkipEvents.length > MAX_EVENT_ARRAY_SIZE) meta.snapshotSkipEvents.splice(0, meta.snapshotSkipEvents.length - MAX_EVENT_ARRAY_SIZE);
         log('SNAPSHOT_SKIP_LOCAL', { symbol, trigger, force, wait: waitMs - (now - meta.lastSnapshotAttempt) });
         return;
     }
@@ -1474,6 +1520,7 @@ async function fetchSnapshot(symbol: string, trigger: string, force = false) {
         const snapshotResult = applySnapshot(ob, data);
         meta.lastSnapshotOk = now;
         meta.snapshotOkEvents.push(now);
+        if (meta.snapshotOkEvents.length > MAX_EVENT_ARRAY_SIZE) meta.snapshotOkEvents.splice(0, meta.snapshotOkEvents.length - MAX_EVENT_ARRAY_SIZE);
         meta.snapshotLastUpdateId = data.lastUpdateId;
         meta.backoffMs = MIN_BACKOFF_MS;
         meta.consecutiveErrors = 0;
@@ -2918,9 +2965,9 @@ function broadcastMetrics(
     precomputed?: { tasMetrics?: any; cvdMetrics?: any[]; legacyMetrics?: any; advancedBundle?: AdvancedMicrostructureBundle },
     receiptTimeMs?: number
 ) {
-    const GLOBAL_MIN_GAP_MS = 75;
-    const DEPTH_THROTTLE_MS = 350;
-    const TRADE_THROTTLE_MS = 250;
+    const GLOBAL_MIN_GAP_MS = 200;
+    const DEPTH_THROTTLE_MS = 500;
+    const TRADE_THROTTLE_MS = 500;
     const meta = getMeta(s);
     if (leg) leg.updateOpenInterest();
     const now = Date.now();
@@ -4714,7 +4761,7 @@ setInterval(() => {
     activeSymbols.forEach((symbol) => {
         evaluateLiveReadiness(symbol);
     });
-}, 1000);
+}, 5000); // 5s instead of 1s — reduces CPU overhead from per-symbol evaluation loops
 
 // [PHASE 1] Rate-limit aware staggered OI Updates
 let oiTick = 0;

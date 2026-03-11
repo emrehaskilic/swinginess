@@ -200,11 +200,23 @@ export class RollingStats {
 
   private evictOld(nowTs: number): void {
     const cutoff = nowTs - this.windowMs;
-    while (this.samples.length > 0 && this.samples[0].ts < cutoff) {
-      const sample = this.samples.shift();
-      if (!sample) break;
-      this.welford.remove(sample.value);
-      this.histogram.remove(sample.value);
+    if (this.samples.length === 0 || this.samples[0].ts >= cutoff) return;
+
+    // Binary search for the first sample within the window — O(log n) instead of O(n) shift loop
+    let lo = 0, hi = this.samples.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (this.samples[mid].ts < cutoff) lo = mid + 1;
+      else hi = mid;
+    }
+
+    // Remove all expired entries in one batch
+    if (lo > 0) {
+      for (let i = 0; i < lo; i++) {
+        this.welford.remove(this.samples[i].value);
+        this.histogram.remove(this.samples[i].value);
+      }
+      this.samples.splice(0, lo);
     }
   }
 }
