@@ -89,6 +89,8 @@ export class SymbolActor {
   private pendingClosedTradeRealizedPnl = 0;
   private positionOpenedAtMs: number | null = null;
   private lastTradeFillPrice = 0;
+  /** DFS percentile of the most recent ENTRY_PROBE action — stored until fill arrives */
+  private pendingEntryDfsP: number | null = null;
 
   readonly state: SymbolState;
 
@@ -318,8 +320,12 @@ export class SymbolActor {
 
     if (actions.length > 0 && !(actions.length === 1 && actions[0].type === 'NOOP')) {
       // Optimistic State Update
-      if (actions.some(a => a.type === 'ENTRY_PROBE' || a.type === 'ADD_POSITION')) {
+      const entryAction = actions.find(a => a.type === 'ENTRY_PROBE');
+      if (entryAction || actions.some(a => a.type === 'ADD_POSITION')) {
         this.state.pendingEntry = true;
+        if (entryAction?.entryDfsP != null) {
+          this.pendingEntryDfsP = entryAction.entryDfsP;
+        }
       }
       await this.deps.onActions(actions);
     }
@@ -457,16 +463,24 @@ export class SymbolActor {
         const side = event.positionAmt > 0 ? 'LONG' : 'SHORT';
         const sideChanged = this.state.position?.side && this.state.position.side !== side;
         const prevPeak = this.state.position?.peakPnlPct ?? event.unrealizedPnL;
+        const isNewPosition = !hadPosition || Boolean(sideChanged);
         this.state.position = {
           side,
           qty,
           entryPrice: event.entryPrice,
           unrealizedPnlPct: event.unrealizedPnL,
-          addsUsed: this.state.position?.addsUsed ?? 0,
+          addsUsed: sideChanged ? 0 : (this.state.position?.addsUsed ?? 0),
           peakPnlPct: Math.max(prevPeak, event.unrealizedPnL),
           profitLockActivated: sideChanged ? false : (this.state.position?.profitLockActivated ?? false),
           hardStopPrice: sideChanged ? null : (this.state.position?.hardStopPrice ?? null),
+          // Alpha decay: set entryDfsP when position first opens, preserve on updates
+          entryDfsP: isNewPosition
+            ? (this.pendingEntryDfsP ?? null)
+            : (this.state.position?.entryDfsP ?? null),
         };
+        if (isNewPosition) {
+          this.pendingEntryDfsP = null; // consumed
+        }
         if (!hadPosition || Boolean(sideChanged)) {
           this.positionOpenedAtMs = event.event_time_ms;
         }
@@ -494,6 +508,14 @@ export class SymbolActor {
             cvdSlope: this.lastCvdSlope,
           },
         });
+        // Feed realized trade outcome to adaptive DFS weight updater
+        if (closeEntry > 0 && closeExit > 0) {
+          const pnlFraction = closeSide === 'LONG'
+            ? (closeExit - closeEntry) / closeEntry
+            : (closeEntry - closeExit) / closeEntry;
+          this.deps.decisionEngine.updateDfsWeightsFromTrade(closeSide, pnlFraction);
+        }
+
         this.pendingClosedTradeRealizedPnl = 0;
         this.positionOpenedAtMs = null;
         this.lastTradeFillPrice = 0;

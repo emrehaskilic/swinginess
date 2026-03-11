@@ -49,13 +49,111 @@ const DEFAULT_WEIGHTS: DirectionalFlowWeights = {
   w8: 0.06,
 };
 
+// ---------------------------------------------------------------------------
+// Adaptive weight update state
+// ---------------------------------------------------------------------------
+
+/** Tracks how predictive each DFS component was over recent closed trades */
+interface ComponentPerformanceRecord {
+  /** signed component value at entry (positive = bullish, negative = bearish) */
+  entrySignedValue: number;
+  /** realized PnL as signed fraction (positive = profit, negative = loss) */
+  pnlFraction: number;
+}
+
 export class DirectionalFlowScore {
   private readonly norm: NormalizationStore;
   private readonly weights: DirectionalFlowWeights;
 
+  // Adaptive weight learning rate (EMA alpha)
+  private readonly EMA_ALPHA = 0.08;
+  // Minimum/maximum weight bounds
+  private readonly W_MIN = 0.02;
+  private readonly W_MAX = 0.40;
+
+  // Recent component-to-pnl records for EMA update
+  private readonly perfHistory: Record<keyof DirectionalFlowWeights, ComponentPerformanceRecord[]> = {
+    w1: [], w2: [], w3: [], w4: [], w5: [], w6: [], w7: [], w8: [],
+  };
+  private readonly PERF_WINDOW = 30; // last 30 trades
+
+  // Last computed components (preserved for post-trade feedback)
+  private lastComponents: Record<string, number> = {};
+
   constructor(norm: NormalizationStore, weights?: Partial<DirectionalFlowWeights>) {
     this.norm = norm;
     this.weights = { ...DEFAULT_WEIGHTS, ...(weights || {}) };
+  }
+
+  /**
+   * Call this after a position is closed to update component weights via EMA.
+   *
+   * @param side        - position side ('LONG' | 'SHORT')
+   * @param pnlFraction - realized PnL as fraction (e.g. 0.015 = +1.5%, -0.008 = -0.8%)
+   *
+   * Logic:
+   *  - For each component, compare its signed value at entry to the trade outcome.
+   *  - If component was aligned with profitable direction → weight++
+   *  - If component was misaligned or trade was losing → weight--
+   *  - Weights are re-normalized to sum to 1 after each update.
+   */
+  updateWeightsFromTrade(side: 'LONG' | 'SHORT', pnlFraction: number): void {
+    const keys: (keyof DirectionalFlowWeights)[] = ['w1','w2','w3','w4','w5','w6','w7','w8'];
+    const componentKeys: Record<keyof DirectionalFlowWeights, string> = {
+      w1: 'zDelta', w2: 'zCvd', w3: 'zLogP', w4: 'zObiW',
+      w5: 'zObiD', w6: 'sweepSigned', w7: 'burstSigned', w8: 'oiImpulse',
+    };
+    const dirMult = side === 'LONG' ? 1 : -1;
+
+    for (const wk of keys) {
+      const compName = componentKeys[wk];
+      const rawVal = this.lastComponents[compName] ?? 0;
+      const signedVal = dirMult * rawVal; // positive = aligned with position direction
+
+      const record: ComponentPerformanceRecord = {
+        entrySignedValue: signedVal,
+        pnlFraction,
+      };
+      this.perfHistory[wk].push(record);
+      if (this.perfHistory[wk].length > this.PERF_WINDOW) {
+        this.perfHistory[wk].shift();
+      }
+    }
+
+    // Compute predictive quality per component: avg(sign(entry) * sign(pnl))
+    const predictiveScores: Record<keyof DirectionalFlowWeights, number> = {} as any;
+    for (const wk of keys) {
+      const records = this.perfHistory[wk];
+      if (records.length === 0) {
+        predictiveScores[wk] = 0;
+        continue;
+      }
+      const score = records.reduce((sum, r) => {
+        const align = Math.sign(r.entrySignedValue) * Math.sign(r.pnlFraction);
+        return sum + align;
+      }, 0) / records.length; // range [-1, 1]
+      predictiveScores[wk] = score;
+    }
+
+    // EMA update: if component was predictive (score > 0) → slightly increase weight
+    for (const wk of keys) {
+      const delta = this.EMA_ALPHA * predictiveScores[wk] * DEFAULT_WEIGHTS[wk];
+      const newWeight = Math.max(this.W_MIN, Math.min(this.W_MAX, this.weights[wk] + delta));
+      this.weights[wk] = newWeight;
+    }
+
+    // Re-normalize so weights sum to 1
+    const total = keys.reduce((s, k) => s + this.weights[k], 0);
+    if (total > EPS) {
+      for (const wk of keys) {
+        this.weights[wk] = this.weights[wk] / total;
+      }
+    }
+  }
+
+  /** Returns a snapshot of current adaptive weights (for logging/monitoring) */
+  getCurrentWeights(): DirectionalFlowWeights {
+    return { ...this.weights };
   }
 
   compute(input: DirectionalFlowInput): DirectionalFlowOutput {
@@ -101,19 +199,20 @@ export class DirectionalFlowScore {
     this.norm.update('dfs', dfs, input.nowMs);
     const dfsPercentile = this.norm.percentile('dfs', dfs);
 
-    return {
-      dfs,
-      dfsPercentile,
-      components: {
-        zDelta,
-        zCvd,
-        zLogP,
-        zObiW,
-        zObiD,
-        sweepSigned,
-        burstSigned,
-        oiImpulse,
-      },
+    const components = {
+      zDelta,
+      zCvd,
+      zLogP,
+      zObiW,
+      zObiD,
+      sweepSigned,
+      burstSigned,
+      oiImpulse,
     };
+
+    // Preserve for adaptive weight feedback after trade close
+    this.lastComponents = components;
+
+    return { dfs, dfsPercentile, components };
   }
 }

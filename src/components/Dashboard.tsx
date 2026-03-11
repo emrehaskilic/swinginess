@@ -1,14 +1,16 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import LiveTelemetryDashboard from './LiveTelemetryDashboard';
 import DryRunDashboard from './DryRunDashboard';
+import SwingRunDashboard from './SwingRunDashboard';
 import { Dashboard as DashboardV1 } from './Dashboard/index';
 import { isViewerModeEnabled } from '../services/proxyAuth';
 
-type AppTab = 'ui-v1' | 'telemetry' | 'dry-run';
+type AppTab = 'ui-v1' | 'telemetry' | 'dry-run' | 'swing-run';
 
 function tabFromHash(hash: string): AppTab {
   if (hash === '#ui-v1') return 'ui-v1';
   if (hash === '#dry-run') return 'dry-run';
+  if (hash === '#swing-run') return 'swing-run';
   return 'ui-v1';
 }
 
@@ -16,14 +18,14 @@ const Dashboard: React.FC = () => {
   const readonlyViewer = useMemo(() => isViewerModeEnabled(), []);
   const [activeTab, setActiveTab] = useState<AppTab>(() => {
     const initial = tabFromHash(window.location.hash);
-    if (readonlyViewer && initial === 'dry-run') return 'ui-v1';
+    if (readonlyViewer && (initial === 'dry-run' || initial === 'swing-run')) return 'ui-v1';
     return initial;
   });
 
   useEffect(() => {
     const onHashChange = () => {
       const next = tabFromHash(window.location.hash);
-      if (readonlyViewer && next === 'dry-run') {
+      if (readonlyViewer && (next === 'dry-run' || next === 'swing-run')) {
         setActiveTab('ui-v1');
         return;
       }
@@ -43,20 +45,17 @@ const Dashboard: React.FC = () => {
           { id: 'ui-v1', label: 'Dashboard v1' },
           { id: 'telemetry', label: 'Live Telemetry' },
           { id: 'dry-run', label: 'Dry Run' },
+          { id: 'swing-run', label: 'Swing Run' },
         ]
   ), [readonlyViewer]);
 
   const setTab = (tab: AppTab) => {
-    if (readonlyViewer && tab !== 'telemetry') {
-      // Viewer mode keeps dry-run disabled but still allows UI v1.
-      if (tab === 'dry-run') return;
-    }
+    if (readonlyViewer && (tab === 'dry-run' || tab === 'swing-run')) return;
     setActiveTab(tab);
-    const hash = tab === 'dry-run'
-      ? '#dry-run'
-      : tab === 'ui-v1'
-        ? '#ui-v1'
-        : '#telemetry';
+    const hash = tab === 'dry-run' ? '#dry-run'
+      : tab === 'swing-run' ? '#swing-run'
+      : tab === 'ui-v1' ? '#ui-v1'
+      : '#telemetry';
     if (window.location.hash !== hash) {
       window.history.replaceState(null, '', hash);
     }
@@ -101,6 +100,12 @@ const Dashboard: React.FC = () => {
       {!readonlyViewer && (
         <div className={activeTab === 'dry-run' ? 'block' : 'hidden'}>
           <DryRunDashboard />
+        </div>
+      )}
+
+      {!readonlyViewer && (
+        <div className={activeTab === 'swing-run' ? 'block' : 'hidden'}>
+          <SwingRunDashboard />
         </div>
       )}
     </div>

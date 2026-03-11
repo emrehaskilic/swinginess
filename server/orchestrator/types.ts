@@ -16,6 +16,8 @@ export interface OrchestratorMetricsInput {
     obiDeep?: number | null;
     deltaZ?: number | null;
     cvdSlope?: number | null;
+    /** Normalized Order Flow Imbalance (-1 to +1): tick-by-tick bid/ask delta changes */
+    ofiNormalized?: number | null;
   } | null;
   multiTimeframe?: {
     m1TrendScore?: number | null;
@@ -77,6 +79,8 @@ export interface DecisionAction {
   reduceOnly?: boolean;
   expectedPrice?: number | null;
   reason?: string;
+  /** DFS percentile at decision time — stored in PositionState for alpha decay tracking */
+  entryDfsP?: number | null;
 }
 
 export interface OpenOrderState {
@@ -119,6 +123,8 @@ export interface PositionState {
   peakPnlPct: number;
   profitLockActivated: boolean;
   hardStopPrice: number | null;
+  /** DFS percentile recorded at entry — used for alpha decay exit tracking */
+  entryDfsP?: number | null;
 }
 
 export interface ExecQualityState {

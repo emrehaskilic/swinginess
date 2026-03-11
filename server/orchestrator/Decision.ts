@@ -50,6 +50,10 @@ export class DecisionEngine {
     const legacyDeltaZ = Number(metrics.legacyMetrics?.deltaZ ?? 0);
     const legacyCvdSlope = Number(metrics.legacyMetrics?.cvdSlope ?? 0);
     const legacyObiDeep = Number(metrics.legacyMetrics?.obiDeep ?? 0);
+    // OFI: normalize to [-1,1]; falls back to OBI when not available
+    const legacyOfi = metrics.legacyMetrics?.ofiNormalized != null
+      ? Number(metrics.legacyMetrics.ofiNormalized)
+      : legacyObiDeep;
     const printsPerSecond = Math.max(0, Number(metrics.prints_per_second ?? 0));
     const tradeCount = Math.max(5, Math.round(printsPerSecond * 60));
     const syntheticBurstSide = legacyDeltaZ > 0 ? 'buy' : legacyDeltaZ < 0 ? 'sell' : null;
@@ -80,10 +84,13 @@ export class DecisionEngine {
         delta5s: legacyDeltaZ,
         deltaZ: legacyDeltaZ,
         cvdSlope: legacyCvdSlope,
-        obiWeighted: legacyObiDeep,
-        obiDeep: legacyObiDeep,
-        obiDivergence: 0,
+        obiWeighted: legacyOfi,      // OFI replaces static OBI for weighted (w4)
+        obiDeep: legacyObiDeep,      // deep book OBI preserved for w5
+        obiDivergence: legacyOfi - legacyObiDeep,
       },
+      funding: metrics.funding
+        ? { rate: metrics.funding.rate ?? null, timeToFundingMs: metrics.funding.timeToFundingMs ?? null }
+        : null,
       openInterest: null,
       absorption: null,
       bootstrap: {
@@ -134,6 +141,7 @@ export class DecisionEngine {
           reduceOnly: false,
           expectedPrice: priceRef,
           reason: act.reason,
+          entryDfsP: act.type === 'ENTRY' ? decision.dfsPercentile : null,
         });
         continue;
       }
@@ -200,6 +208,7 @@ export class DecisionEngine {
       unrealizedPnlPct,
       addsUsed: position.addsUsed,
       peakPnlPct,
+      entryDfsP: position.entryDfsP ?? null,
     };
   }
 
@@ -271,6 +280,11 @@ export class DecisionEngine {
     if (allowed === 'LONG') return side === 'BUY';
     if (allowed === 'SHORT') return side === 'SELL';
     return true;
+  }
+
+  /** Delegate post-trade feedback to adaptive DFS weight updater */
+  updateDfsWeightsFromTrade(side: 'LONG' | 'SHORT', pnlFraction: number): void {
+    this.strategy.updateDfsWeightsFromTrade(side, pnlFraction);
   }
 
   computeCooldownMs(deltaZ: number, printsPerSecond: number, minMs: number, maxMs: number): number {

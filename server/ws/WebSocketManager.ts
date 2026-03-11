@@ -129,6 +129,21 @@ export class WebSocketManager {
     return sent;
   }
 
+  /** Broadcast a raw string payload to ALL connected clients (used for heartbeats) */
+  broadcastAll(payload: string): number {
+    let sent = 0;
+    for (const client of this.clients) {
+      if (client.readyState !== WebSocket.OPEN) continue;
+      try {
+        client.send(payload);
+        sent++;
+      } catch {
+        this.cleanupClient(client, 'error');
+      }
+    }
+    return sent;
+  }
+
   shutdown(): void {
     clearInterval(this.timer);
     for (const client of this.clients) {

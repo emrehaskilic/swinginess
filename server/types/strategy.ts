@@ -117,6 +117,8 @@ export interface StrategyPositionState {
   sizePct?: number;
   timeInPositionMs?: number;
   peakPnlPct?: number;
+  /** DFS percentile at position entry — used for alpha decay exit tracking */
+  entryDfsP?: number | null;
 }
 
 export type StrategyTrendState = 'UPTREND' | 'DOWNTREND' | 'PULLBACK_UP' | 'PULLBACK_DOWN' | 'RANGE';
@@ -250,6 +252,10 @@ export interface StrategyInput {
     obiDeep: number;
     obiDivergence: number;
   };
+  funding?: {
+    rate: number | null;
+    timeToFundingMs: number | null;
+  } | null;
   openInterest?: {
     oiChangePct: number;
     lastUpdatedMs: number;

@@ -14,6 +14,8 @@ export interface PendingLimitOrder {
   createdAtMs: number;
   timeoutMs: number;
   repriceAttempts: number;
+  /** When true, timeout will only cancel — no market fallback will be placed */
+  noMarketFallback?: boolean;
 }
 
 const DEFAULT_LIMIT_ORDER_TIMEOUT_MS = 30_000;
@@ -59,6 +61,7 @@ export class OrderMonitor {
     role: OrderRole;
     createdAtMs?: number;
     timeoutMs?: number;
+    noMarketFallback?: boolean;
   }) {
     const timeoutMs = Number.isFinite(input.timeoutMs as number)
       ? Math.max(1_000, Number(input.timeoutMs))
@@ -77,6 +80,7 @@ export class OrderMonitor {
       createdAtMs: input.createdAtMs || Date.now(),
       timeoutMs,
       repriceAttempts: 0,
+      noMarketFallback: input.noMarketFallback ?? false,
     });
   }
 
@@ -156,7 +160,7 @@ export class OrderMonitor {
           }
         }
 
-        if (remainingQty > 0) {
+        if (remainingQty > 0 && !order.noMarketFallback) {
           await this.deps.placeMarketOrder({
             symbol: order.symbol,
             side: order.side,
@@ -164,6 +168,13 @@ export class OrderMonitor {
             reduceOnly: order.reduceOnly,
             role: order.role,
             fallbackFromOrderId: order.orderId,
+          });
+        } else if (remainingQty > 0 && order.noMarketFallback) {
+          this.deps.log?.('LIMIT_TIMEOUT_CANCEL_ONLY', {
+            symbol: order.symbol,
+            orderId: order.orderId,
+            role: order.role,
+            remainingQty,
           });
         }
         this.pendingLimitOrders.delete(order.orderId);

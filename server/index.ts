@@ -53,6 +53,7 @@ import { SymbolEventQueue } from './utils/SymbolEventQueue';
 import { SnapshotTracker } from './telemetry/Snapshot';
 import { apiKeyMiddleware, validateWebSocketApiKey } from './auth/apiKey';
 import { NewStrategyV11 } from './strategy/NewStrategyV11';
+import { SwingRunService } from './swing/SwingRunService';
 import { DecisionLog } from './telemetry/DecisionLog';
 import { DryRunConfig, DryRunEngine, DryRunEventInput, DryRunSessionService, isUpstreamGuardError } from './dryrun';
 import { logger, requestLogger, serializeError } from './utils/logger';
@@ -158,6 +159,9 @@ const BINANCE_WS_RECONNECT_DELAY_MS = Math.max(1000, Number(process.env.BINANCE_
 const BLOCKED_TELEMETRY_INTERVAL_MS = Number(process.env.BLOCKED_TELEMETRY_INTERVAL_MS || 1000);
 const MIN_RESYNC_INTERVAL_MS = 15000;
 const GRACE_PERIOD_MS = 5000;
+// Depth updates stop arriving when orderbook is quiet (no price changes).
+// Use a much wider window before declaring orderbook untrusted.
+const DEPTH_TRUSTED_MS = Math.max(GRACE_PERIOD_MS, Number(process.env.DEPTH_TRUSTED_MS || 30000));
 const ORDERBOOK_CATCHUP_GRACE_MS = Math.max(
     GRACE_PERIOD_MS,
     Number(process.env.ORDERBOOK_CATCHUP_GRACE_MS || 30000)
@@ -177,6 +181,9 @@ const ENABLE_CROSS_MARKET_CONFIRMATION = process.env.ENABLE_CROSS_MARKET_CONFIRM
 
 // [PHASE 3] Execution Flags
 let KILL_SWITCH = false;
+// Set to true during WS stream reconfiguration to suppress spurious kill switch
+// triggers from ResiliencePatches (flash crash, latency) until data resumes.
+let wsReconnectInProgress = false;
 function parseEnvFlag(value: string | undefined): boolean {
     if (!value) return false;
     const normalized = value.trim().replace(/^['"]|['"]$/g, '').toLowerCase();
@@ -242,7 +249,7 @@ const RISK_ENGINE_CONFIG = {
     killSwitch: {
         latencySpikeThresholdMs: Math.max(10, parseEnvNumber(process.env.RISK_LATENCY_SPIKE_MS, 5000)),
         volatilitySpikeThreshold: Math.max(0.001, Math.min(1, parseEnvNumber(process.env.RISK_VOLATILITY_SPIKE_RATIO, 0.05))),
-        disconnectTimeoutMs: Math.max(1000, parseEnvNumber(process.env.RISK_DISCONNECT_TIMEOUT_MS, 30000)),
+        disconnectTimeoutMs: Math.max(1000, parseEnvNumber(process.env.RISK_DISCONNECT_TIMEOUT_MS, 90000)),
         priceWindowMs: Math.max(1000, parseEnvNumber(process.env.RISK_PRICE_WINDOW_MS, 60000)),
         autoClosePositions: process.env.RISK_AUTO_CLOSE_POSITIONS == null
             ? true
@@ -496,6 +503,23 @@ const analyticsEngine = new AnalyticsEngine({
 const analyticsLastErrorByKind = new Map<string, number>();
 const orchestrator = createOrchestratorFromEnv(alertService);
 const dryRunSession = new DryRunSessionService(alertService);
+// GA→Strategy wiring: applied after getStrategy is defined (callback fires at runtime, not init)
+dryRunSession.onGAEvolution = (symbol, genes, generation) => {
+  try {
+    strategyMap.get(symbol)?.patchConfig({
+      dfsEntryLongBase:  genes.dfsEntryLong,
+      dfsEntryShortBase: genes.dfsEntryShort,
+      atrStopMultiplier: genes.atrStopMultiplier,
+      atrStopMin:        genes.atrStopMin,
+      atrStopMax:        genes.atrStopMax,
+      targetVolPct:      genes.targetVolPct,
+    });
+    console.log(`[GA] Gen ${generation} → applied best genes to ${symbol}:`, genes);
+  } catch (err) {
+    console.error(`[GA] Failed to patch strategy config for ${symbol}:`, err);
+  }
+};
+const swingRunService = new SwingRunService();
 const strategySignalsBySymbol = new Map<string, StrategySignal[]>();
 type StrategyConsensusSnapshot = {
     timestampMs: number;
@@ -668,6 +692,12 @@ function resetDryRunRuntimeState(initialEquityUsdt?: number): void {
             resiliencePatches.initialize(institutionalRiskEngine);
         }
     }
+
+    // Always clear the global kill switch flag when resetting dry run state.
+    // The risk engine was just recreated (TRACKING state), so any previously
+    // active kill switch is gone — sync the global flag accordingly.
+    KILL_SWITCH = false;
+    orchestrator.setKillSwitch(false);
 }
 
 function logAnalyticsError(kind: string, symbol: string | null, error: unknown): void {
@@ -858,6 +888,10 @@ function syncRiskEngineRuntime(
     institutionalRiskEngine.recordLatency(latencyMs, now);
     if (RESILIENCE_PATCHES_ENABLED) {
         resiliencePatches.recordLatency(latencyMs, now, 'processing');
+    }
+    // Auto-recover kill switch triggered by disconnect: if messages are flowing again, clear it
+    if (RISK_ENGINE_ENABLED && institutionalRiskEngine.getRiskState() === RiskState.KILL_SWITCH) {
+        maybeRecoverDisconnectKillSwitch('data_resumed');
     }
 
     if (Number(midPrice || 0) > 0) {
@@ -1056,10 +1090,14 @@ function isOrderbookTrusted(symbol: string, now = Date.now()): boolean {
     const meta = getMeta(symbol);
     const ob = getOrderbook(symbol);
     const integrity = getIntegrity(symbol).getStatus(now);
-    const depthRecentlyApplied = meta.lastDepthApplyTs > 0 && (now - meta.lastDepthApplyTs) <= GRACE_PERIOD_MS;
+    // Use DEPTH_TRUSTED_MS (30s) instead of GRACE_PERIOD_MS (5s).
+    // Depth updates stop arriving when book is quiet — this is normal, not a failure.
+    const depthRecentlyApplied = meta.lastDepthApplyTs > 0 && (now - meta.lastDepthApplyTs) <= DEPTH_TRUSTED_MS;
+    // Also accept: if trade messages are still flowing, book can be quiet but still valid
+    const tradeDataFresh = meta.lastDepthMsgTs > 0 && (now - meta.lastDepthMsgTs) <= GRACE_PERIOD_MS;
     return ob.uiState === 'LIVE'
         && integrity.level === 'OK'
-        && depthRecentlyApplied
+        && (depthRecentlyApplied || tradeDataFresh)
         && !meta.isResyncing
         && snapshotInProgress.get(symbol) !== true;
 }
@@ -1514,6 +1552,16 @@ const dryRunPreviewSymbols = new Set<string>();
 let wsConnectTimeoutHandle: NodeJS.Timeout | null = null;
 let wsReconnectHandle: NodeJS.Timeout | null = null;
 let wsConnectAttemptSeq = 0;
+// Keep-alive: periodic ping to detect silent drops
+let wsKeepaliveHandle: NodeJS.Timeout | null = null;
+let wsLastPongAt = 0;
+// Proactive 23h reconnect (Binance closes at 24h)
+let wsMaxAgeHandle: NodeJS.Timeout | null = null;
+// Exponential backoff for reconnects
+let wsReconnectAttempts = 0;
+const WS_KEEPALIVE_INTERVAL_MS = 10 * 60 * 1000;  // 10 minutes
+const WS_PONG_TIMEOUT_MS = 15 * 1000;              // 15 seconds
+const WS_MAX_AGE_MS = 23 * 60 * 60 * 1000;        // 23 hours
 const wsManager = new WebSocketManager({
     onSubscriptionsChanged: () => {
         updateStreams();
@@ -1615,6 +1663,73 @@ function clearWsReconnectTimer(): void {
     }
 }
 
+function clearWsKeepalive(): void {
+    if (wsKeepaliveHandle) {
+        clearInterval(wsKeepaliveHandle);
+        wsKeepaliveHandle = null;
+    }
+}
+
+function clearWsMaxAge(): void {
+    if (wsMaxAgeHandle) {
+        clearTimeout(wsMaxAgeHandle);
+        wsMaxAgeHandle = null;
+    }
+}
+
+function getReconnectDelayMs(): number {
+    // Exponential backoff: 5s, 10s, 20s, 40s, max 60s — with ±20% jitter.
+    // wsReconnectAttempts has already been incremented before this is called,
+    // so subtract 1 to make the first attempt use the base delay (5s) rather than 2× it.
+    const exp = Math.max(0, wsReconnectAttempts - 1);
+    const base = Math.min(BINANCE_WS_RECONNECT_DELAY_MS * Math.pow(2, exp), 60000);
+    const jitter = base * 0.2 * (Math.random() - 0.5);
+    return Math.round(base + jitter);
+}
+
+function scheduleReconnect(reason: string): void {
+    if (wsReconnectHandle || activeSymbols.size === 0) return;
+    wsReconnectAttempts++;
+    const delayMs = getReconnectDelayMs();
+    log('WS_RECONNECT_SCHEDULED', { reason, attempt: wsReconnectAttempts, delayMs });
+    wsReconnectHandle = setTimeout(() => {
+        wsReconnectHandle = null;
+        updateStreams();
+    }, delayMs);
+}
+
+function startWsKeepalive(socket: WebSocket): void {
+    clearWsKeepalive();
+    wsLastPongAt = Date.now();
+    wsKeepaliveHandle = setInterval(() => {
+        if (ws !== socket || socket.readyState !== WebSocket.OPEN) {
+            clearWsKeepalive();
+            return;
+        }
+        const sinceLastPong = Date.now() - wsLastPongAt;
+        if (sinceLastPong > WS_KEEPALIVE_INTERVAL_MS + WS_PONG_TIMEOUT_MS) {
+            log('WS_KEEPALIVE_TIMEOUT', { sinceLastPongMs: sinceLastPong });
+            forceSocketReconnect(socket, 'keepalive_timeout', { sinceLastPongMs: sinceLastPong });
+            return;
+        }
+        try {
+            socket.ping();
+        } catch (e: any) {
+            log('WS_PING_ERROR', { msg: e?.message });
+        }
+    }, WS_KEEPALIVE_INTERVAL_MS);
+}
+
+function startWsMaxAgeTimer(socket: WebSocket): void {
+    clearWsMaxAge();
+    wsMaxAgeHandle = setTimeout(() => {
+        if (ws !== socket) return;
+        log('WS_MAX_AGE_RECONNECT', { maxAgeMs: WS_MAX_AGE_MS });
+        // Close cleanly — the close handler will schedule reconnect
+        closeSocketQuietly(socket, 'max_age_reconnect');
+    }, WS_MAX_AGE_MS);
+}
+
 function closeSocketQuietly(socket: WebSocket | null, reason: string): void {
     if (!socket) {
         return;
@@ -1639,6 +1754,8 @@ function forceSocketReconnect(socket: WebSocket, reason: string, metadata: Recor
     }
     log('WS_FORCE_RECONNECT', { reason, readyState: socket.readyState, ...metadata });
     clearWsConnectTimeout();
+    clearWsKeepalive();
+    clearWsMaxAge();
     closeSocketQuietly(socket, reason);
     if (socket.readyState !== WebSocket.CLOSING && socket.readyState !== WebSocket.CLOSED) {
         try {
@@ -1659,28 +1776,40 @@ function maybeRecoverDisconnectKillSwitch(reason: string): void {
     const lastEvent = institutionalRiskEngine.getGuards().killSwitch.getKillSwitchEvents().slice(-1)[0];
     const lastReason = String(lastEvent?.reason || '');
     if (!/connection lost/i.test(lastReason)) {
+        // Kill switch was triggered by something other than a disconnect (manual, latency spike, etc.)
+        // Do not auto-recover those.
         return;
     }
 
-    const dryRunStatus = dryRunSession.getStatus();
+    // Kill switch was triggered solely by a connection loss.
+    // When the WebSocket reconnects (ws_open) or data resumes, clear the kill switch
+    // unconditionally — the dry run session continues uninterrupted.
+    // NOTE: resetDryRunRuntimeState only resets the risk engine and analytics tracking;
+    // it does NOT touch the active dry run session or positions.
     const executionStatus = orchestrator.getExecutionStatus();
-    const hasDryRun = Boolean(dryRunStatus.running);
-    const hasExecutionSymbols = Array.isArray(executionStatus.selectedSymbols) && executionStatus.selectedSymbols.length > 0;
-    const hasLiveExecution = EXECUTION_ENABLED && hasExecutionSymbols;
-    if (hasDryRun || hasLiveExecution) {
-        log('WS_KILL_SWITCH_RECOVERY_SKIPPED', {
-            reason,
-            lastReason,
-            dryRunRunning: hasDryRun,
-            executionSymbols: executionStatus.selectedSymbols || [],
-        });
-        return;
-    }
-
     resetDryRunRuntimeState(riskEngineLastKnownEquity || RISK_ENGINE_DEFAULT_EQUITY_USDT);
     KILL_SWITCH = false;
     orchestrator.setKillSwitch(false);
-    log('WS_KILL_SWITCH_RECOVERED', { reason, previousReason: lastReason });
+
+    // Force-refresh warmup state for all active symbols so that stale
+    // ORDERBOOK_UNHEALTHY vetoes from during the kill switch period
+    // are cleared immediately instead of waiting for the next strategy eval.
+    const now = Date.now();
+    for (const sym of activeSymbols) {
+        if (dryRunSession.isTrackingSymbol(sym)) {
+            const trusted = isOrderbookTrusted(sym, now);
+            dryRunSession.updateRuntimeContext(sym, {
+                timestampMs: now,
+                orderbookTrusted: trusted,
+            });
+        }
+    }
+
+    log('WS_KILL_SWITCH_RECOVERED', {
+        reason,
+        previousReason: lastReason,
+        executionSymbols: executionStatus.selectedSymbols || [],
+    });
 }
 
 function updateStreams() {
@@ -1735,12 +1864,24 @@ function updateStreams() {
 
     clearWsConnectTimeout();
     clearWsReconnectTimer();
-    if (ws) closeSocketQuietly(ws, 'stream_reconfigure');
+    clearWsKeepalive();
+    clearWsMaxAge();
+    if (ws) {
+        // Refresh the disconnect timer before closing so the 90-second window
+        // starts from now (not from the last market message), giving ample time
+        // for the new socket to connect and send the first heartbeat.
+        if (RISK_ENGINE_ENABLED) {
+            institutionalRiskEngine.recordHeartbeat(Date.now());
+        }
+        // Suppress spurious resilience kill-switch triggers during reconnect gap.
+        wsReconnectInProgress = true;
+        closeSocketQuietly(ws, 'stream_reconfigure');
+    }
 
     activeSymbols = new Set(effective);
     const streams = [...activeSymbols].flatMap(s => {
         const l = s.toLowerCase();
-        return [buildDepthStream(l), `${l}@trade`];
+        return [buildDepthStream(l), `${l}@trade`, `${l}@forceOrder`];
     });
 
     const url = `${BINANCE_WS_BASE}?streams=${streams.join('/')}`;
@@ -1768,8 +1909,18 @@ function updateStreams() {
         clearWsConnectTimeout();
         clearWsReconnectTimer();
         wsState = 'connected';
+        wsReconnectAttempts = 0; // reset backoff on successful connect
+        wsReconnectInProgress = false; // reconnect complete — resilience guard re-enabled
         log('WS_OPEN', {});
+        // Reset heartbeat timer immediately on open so the 30s disconnect timer
+        // doesn't fire before the first market message arrives.
+        if (RISK_ENGINE_ENABLED) {
+            institutionalRiskEngine.recordHeartbeat(Date.now());
+        }
         maybeRecoverDisconnectKillSwitch('ws_open');
+        // Start keepalive ping + 23h max-age proactive reconnect
+        startWsKeepalive(socket);
+        startWsMaxAgeTimer(socket);
 
         activeSymbols.forEach((symbol) => {
             const ob = getOrderbook(symbol);
@@ -1804,17 +1955,24 @@ function updateStreams() {
         });
     });
 
+    socket.on('pong', () => {
+        if (ws !== socket) return;
+        wsLastPongAt = Date.now();
+    });
+
     socket.on('message', (raw: any) => {
         if (ws !== socket) return;
         handleMsg(raw);
     });
 
-    socket.on('close', () => {
+    socket.on('close', (code, reason) => {
         if (ws !== socket) return;
         clearWsConnectTimeout();
+        clearWsKeepalive();
+        clearWsMaxAge();
         wsState = 'disconnected';
         ws = null;
-        log('WS_CLOSE', {});
+        log('WS_CLOSE', { code, reason: reason?.toString() });
         const now = Date.now();
         for (const symbol of activeSymbols) {
             const meta = getMeta(symbol);
@@ -1824,7 +1982,6 @@ function updateStreams() {
             resetRealtimeSymbolState(symbol, 'ws_reconnect_reset');
             meta.isResyncing = false;
 
-
             // Orderbook state'ini tamamen sıfırla
             resetOrderbookState(ob, { uiState: 'SNAPSHOT_PENDING', keepStats: true, desync: true });
             getIntegrity(symbol).markReconnect(now);
@@ -1833,12 +1990,7 @@ function updateStreams() {
             ob.snapshotRequired = true;
             transitionOrderbookState(symbol, 'SNAPSHOT_PENDING', 'ws_reconnect_reset');
         }
-        if (!wsReconnectHandle && activeSymbols.size > 0) {
-            wsReconnectHandle = setTimeout(() => {
-                wsReconnectHandle = null;
-                updateStreams();
-            }, BINANCE_WS_RECONNECT_DELAY_MS);
-        }
+        scheduleReconnect(`ws_close_${code ?? 'unknown'}`);
     });
 
     socket.on('error', (e) => {
@@ -2320,6 +2472,9 @@ async function processSymbolEvent(s: string, d: any) {
             price: p,
             quantity: q,
         });
+        // [SWING_RUN] Feed price to swing structure module
+        swingRunService.onPrice(s, p, q, Number(t || now));
+
         const bestBidForTrade = bestBid(ob);
         const bestAskForTrade = bestAsk(ob);
         const midForTrade = (bestBidForTrade && bestAskForTrade) ? (bestBidForTrade + bestAskForTrade) / 2 : null;
@@ -2413,6 +2568,14 @@ async function processSymbolEvent(s: string, d: any) {
                 bookMidPrice: Number(mid || 0),
                 referenceTradePrice: Number(p || 0),
             });
+            // [SWING_RUN] Feed dry-run trend direction as external filter for swing entries.
+            // Only confirmed UPTREND → LONG, confirmed DOWNTREND → SHORT; PULLBACK/RANGE → NEUTRAL (wait).
+            const swingExternalTrend: import('./swing/SwingRunService').SwingExternalTrend =
+                runtimeContextForDecision.trendState === 'UPTREND'   ? 'LONG'  :
+                runtimeContextForDecision.trendState === 'DOWNTREND' ? 'SHORT' :
+                'NEUTRAL'; // PULLBACK_UP, PULLBACK_DOWN, RANGE → wait
+            swingRunService.setExternalTrend(s, swingExternalTrend);
+
             const decisionContextForDecision: StrategyDecisionContext = assembleDecisionContext({
                 nowMs: Number(t || now),
                 price: trendPriceForDecision,
@@ -2726,6 +2889,12 @@ function handleMsg(raw: any) {
     try { msg = JSON.parse(raw.toString()); } catch { return; }
     if (!msg.data) return;
 
+    // Route forceOrder liquidation events to the heatmap
+    if (msg.data.e === 'forceOrder') {
+        orchestrator.ingestLiquidationEvent(msg.data);
+        return;
+    }
+
     const s = msg.data.s;
     if (!s) return;
 
@@ -2942,7 +3111,7 @@ function broadcastMetrics(
                 }
             }
         }
-        if (resilienceGuardResult.action === 'KILL_SWITCH' && RISK_ENGINE_ENABLED && institutionalRiskEngine.getRiskState() !== RiskState.KILL_SWITCH) {
+        if (resilienceGuardResult.action === 'KILL_SWITCH' && RISK_ENGINE_ENABLED && institutionalRiskEngine.getRiskState() !== RiskState.KILL_SWITCH && !wsReconnectInProgress) {
             institutionalRiskEngine.activateKillSwitch(`ResiliencePatches blocked ${s}: ${resilienceGuardResult.reasons.join(',')}`);
         } else if (resilienceGuardResult.action === 'HALT' && RISK_ENGINE_ENABLED) {
             institutionalRiskEngine.getStateManager().transition(
@@ -3934,6 +4103,46 @@ app.post('/api/dry-run/run', (req, res) => {
     }
 });
 
+// ─── Swing Run API ────────────────────────────────────────────────────────────
+
+app.get('/api/swing-run/status', (_req, res) => {
+    res.json({ ok: true, status: swingRunService.getStatus() });
+});
+
+app.post('/api/swing-run/start', (req, res) => {
+    try {
+        const body = req.body || {};
+        const symbols: string[] = Array.isArray(body.symbols)
+            ? body.symbols.map((s: unknown) => String(s).toUpperCase()).filter(Boolean)
+            : [];
+        if (symbols.length === 0) {
+            res.status(400).json({ ok: false, error: 'symbols_required' });
+            return;
+        }
+        swingRunService.start({
+            symbols,
+            walletUsdt:            Number(body.walletUsdt           ?? 10000),
+            marginPerSymbolUsdt:   Number(body.marginPerSymbolUsdt  ?? 250),
+            leverage:              Number(body.leverage             ?? 50),
+            brickPct:              Number(body.brickPct             ?? 0.001),
+            maxPyramidLevels:      Number(body.maxPyramidLevels     ?? 3),
+            takerFeeRate:          Number(body.takerFeeRate         ?? 0.0005),
+            slippagePct:           Number(body.slippagePct          ?? 0.0005),
+            bootstrapKlines:       Number(body.bootstrapKlines      ?? 500),
+        }, BINANCE_REST_BASE);
+        res.json({ ok: true, status: swingRunService.getStatus() });
+    } catch (e: any) {
+        res.status(500).json({ ok: false, error: e?.message || 'swing_run_start_failed' });
+    }
+});
+
+app.post('/api/swing-run/stop', (_req, res) => {
+    swingRunService.stop();
+    res.json({ ok: true, status: swingRunService.getStatus() });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 app.get('/api/alpha-decay', (_req, res) => {
     res.json({ ok: true, alphaDecay: [] });
 });
@@ -4444,6 +4653,30 @@ wss.on('connection', (wc, req) => {
         }
     });
 });
+
+// Metrics heartbeat: if a symbol hasn't been broadcast in >5s but has WS subscribers,
+// send a lightweight heartbeat so the frontend doesn't freeze on quiet markets.
+const METRICS_HEARTBEAT_INTERVAL_MS = 5000;
+const METRICS_STALE_THRESHOLD_MS = 5000;
+setInterval(() => {
+    if (wsManager.getClientCount() === 0) return;
+    const now = Date.now();
+    for (const symbol of activeSymbols) {
+        const meta = getMeta(symbol);
+        if (now - meta.lastBroadcastTs < METRICS_STALE_THRESHOLD_MS) continue;
+        // Only send if there are subscribers for this symbol
+        try {
+            wsManager.broadcastToSymbol(symbol, JSON.stringify({
+                type: 'heartbeat',
+                symbol,
+                server_sent_ms: now,
+                wsState,
+            }));
+        } catch {
+            // ignore heartbeat send errors
+        }
+    }
+}, METRICS_HEARTBEAT_INTERVAL_MS);
 
 // Reset 10s counters
 setInterval(() => {

@@ -266,10 +266,18 @@ const DryRunDashboard: React.FC = () => {
 
   const [testOrderSymbol, setTestOrderSymbol] = useState('BTCUSDT');
 
+  // Stabilise: use a string key instead of status.symbols array reference so
+  // that the 1-second polling cycle doesn't re-compute unless the actual list
+  // of symbols changes.  Always fall back to selectedPairs when the dry-run
+  // hasn't populated status.symbols yet (avoids a brief empty-list → WS close).
+  const statusSymbolsKey = status.symbols.join(',');
   const activeMetricSymbols = useMemo(() => {
     const source = status.running && status.symbols.length > 0 ? status.symbols : selectedPairs;
-    return normalizeSymbolList(source);
-  }, [status.running, status.symbols, selectedPairs]);
+    // Ensure we never return an empty list when we had symbols before
+    const normalized = normalizeSymbolList(source);
+    return normalized.length > 0 ? normalized : normalizeSymbolList(selectedPairs);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [status.running, statusSymbolsKey, selectedPairs]);
   const configuredRows = useMemo(() => {
     const wallet = Math.max(0, Number(sharedWalletStart) || 0);
     return selectedPairs.map((symbol) => pairConfigs[symbol] || buildDefaultSymbolCapitalConfig(symbol, wallet));
@@ -364,10 +372,22 @@ const DryRunDashboard: React.FC = () => {
           setStatusBootstrapped(true);
           if (next.running && next.symbols.length > 0) {
             const normalized = normalizeSymbolList(next.symbols);
-            setSelectedPairs(normalized);
+            // Only update selectedPairs when the list actually changes to avoid
+            // creating a new array reference every poll (which triggers useMemo
+            // re-computations and can cause WS reconnects).
+            setSelectedPairs(prev => {
+              const prevKey = prev.join(',');
+              const nextKey = normalized.join(',');
+              return prevKey === nextKey ? prev : normalized;
+            });
             setTestOrderSymbol(normalized[0]);
           } else if (!next.running && next.previewSymbols && next.previewSymbols.length > 0) {
-            setSelectedPairs(normalizeSymbolList(next.previewSymbols));
+            const normalized = normalizeSymbolList(next.previewSymbols);
+            setSelectedPairs(prev => {
+              const prevKey = prev.join(',');
+              const nextKey = normalized.join(',');
+              return prevKey === nextKey ? prev : normalized;
+            });
           } else if (!next.running && next.config) {
             setSharedWalletStart(String(next.config.sharedWalletStartUsdt));
             setHeartbeatSec(String(Math.max(1, Math.round(next.config.heartbeatIntervalMs / 1000))));
@@ -377,7 +397,12 @@ const DryRunDashboard: React.FC = () => {
             }
             if (Object.keys(nextConfigs).length > 0) {
               setPairConfigs(nextConfigs);
-              setSelectedPairs(Object.keys(nextConfigs));
+              const configSymbols = Object.keys(nextConfigs);
+              setSelectedPairs(prev => {
+                const prevKey = prev.join(',');
+                const nextKey = configSymbols.join(',');
+                return prevKey === nextKey ? prev : configSymbols;
+              });
             }
           }
         }
@@ -646,15 +671,15 @@ const DryRunDashboard: React.FC = () => {
         },
         strategyPosition: side && row.position
           ? {
-              side,
-              qty: Number(row.position.qty || 0),
-              entryPrice: Number(row.position.entryPrice || 0),
-              unrealizedPnlPct: Number(row.position.entryPrice || 0) > 0
-                ? (Number(row.position.unrealizedPnl || 0) / Math.max(1e-9, Number(row.position.entryPrice || 0) * Math.max(1e-9, Number(row.position.qty || 0)))) * 100
-                : 0,
-              addsUsed: 0,
-              timeInPositionMs: 0,
-            }
+            side,
+            qty: Number(row.position.qty || 0),
+            entryPrice: Number(row.position.entryPrice || 0),
+            unrealizedPnlPct: Number(row.position.entryPrice || 0) > 0
+              ? (Number(row.position.unrealizedPnl || 0) / Math.max(1e-9, Number(row.position.entryPrice || 0) * Math.max(1e-9, Number(row.position.qty || 0)))) * 100
+              : 0,
+            addsUsed: 0,
+            timeInPositionMs: 0,
+          }
           : null,
         advancedMetrics: {
           sweepFadeScore: 0,
@@ -766,11 +791,10 @@ const DryRunDashboard: React.FC = () => {
             </label>
           </div>
 
-          <div className={`rounded border px-3 py-2 text-xs ${
-            configuredReserveTotal > sharedWalletNumeric
-              ? 'border-amber-800 bg-amber-950/30 text-amber-300'
-              : 'border-zinc-800 bg-zinc-950/40 text-zinc-400'
-          }`}>
+          <div className={`rounded border px-3 py-2 text-xs ${configuredReserveTotal > sharedWalletNumeric
+            ? 'border-amber-800 bg-amber-950/30 text-amber-300'
+            : 'border-zinc-800 bg-zinc-950/40 text-zinc-400'
+            }`}>
             <div>Configured reserve: {formatNum(configuredReserveTotal, 2)} USDT</div>
             <div>Preview reserve scale: {formatNum(reserveScalePreview, 4)}</div>
             <div>Startup mode: {status.config?.startupMode || 'EARLY_SEED_THEN_MICRO'}</div>

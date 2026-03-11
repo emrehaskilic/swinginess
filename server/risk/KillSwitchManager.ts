@@ -48,7 +48,7 @@ export interface KillSwitchEvent {
 const DEFAULT_CONFIG: KillSwitchConfig = {
   latencySpikeThresholdMs: 5000,    // 5 second latency spike
   volatilitySpikeThreshold: 0.05,   // 5% price move
-  disconnectTimeoutMs: 30000,       // 30 second disconnect
+  disconnectTimeoutMs: 90000,       // 90 second disconnect (30s was too short for reconnect cycles)
   priceWindowMs: 60000,             // 1 minute price window
   autoClosePositions: true,
   alertChannels: ['email', 'webhook']

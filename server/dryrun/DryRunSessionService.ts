@@ -14,6 +14,9 @@ import { ActiveTrade, PositionLifecycleManager } from './PositionLifecycleManage
 import { MaterializedSymbolCapitalConfig, SymbolCapitalConfig, materializeSymbolCapitalConfigs, normalizeSymbolCapitalConfigs } from '../types/capital';
 import type { StructureBias, StructureSnapshot, SwingLabel } from '../structure/types';
 import { PositionSizer } from '../position/PositionSizer';
+import { CompositeRewardFunction } from '../metrics/CompositeRewardFunction';
+import { GAParamOptimizer, GAParamGene } from '../strategy/GAParamOptimizer';
+import { MultiTimeframeConfluence, MtfBias, MtfTimeframe, MtfConfluenceResult } from '../metrics/MultiTimeframeConfluence';
 import path from 'path';
 
 export type DryRunStartupMode = 'EARLY_SEED_THEN_MICRO' | 'WAIT_MICRO_WARMUP';
@@ -307,6 +310,10 @@ type SymbolSession = {
   lastExitOrderTs: number;
   lastReduceOrderTs: number;
   workingOrderLogState: WorkingOrderLogState;
+  // Advanced learning modules
+  compositeReward: CompositeRewardFunction;
+  gaOptimizer: GAParamOptimizer;
+  mtfConfluence: MultiTimeframeConfluence;
 };
 
 type AIIntentMetadata = {
@@ -571,6 +578,9 @@ export class DryRunSessionService {
   private readonly winnerManager: WinnerManager;
   private readonly addOnManager: AddOnManager;
   private readonly positionLifecycle = new PositionLifecycleManager();
+
+  /** Called when GA evolution occurs. Wire this in index.ts to apply best genes to strategy. */
+  onGAEvolution?: (symbol: string, genes: GAParamGene, generation: number) => void;
 
   constructor(alertService?: AlertService) {
     this.limitStrategy = new LimitOrderStrategy({
@@ -964,6 +974,9 @@ export class DryRunSessionService {
         lastExitOrderTs: 0,
         lastReduceOrderTs: 0,
         workingOrderLogState: new Map<string, string>(),
+        compositeReward: new CompositeRewardFunction(),
+        gaOptimizer: new GAParamOptimizer(),
+        mtfConfluence: new MultiTimeframeConfluence(),
       });
     }
 
@@ -981,6 +994,51 @@ export class DryRunSessionService {
   isTrackingSymbol(symbol: string): boolean {
     const normalized = normalizeSymbol(symbol);
     return this.running && this.sessions.has(normalized);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Advanced learning module accessors
+  // ---------------------------------------------------------------------------
+
+  /** Feed a 4h timeframe bias into MTF confluence (call when 4h candle closes) */
+  updateMtfBias(symbol: string, timeframe: MtfTimeframe, bias: MtfBias, nowMs?: number): void {
+    const session = this.sessions.get(normalizeSymbol(symbol));
+    if (!session) return;
+    session.mtfConfluence.update(timeframe, bias, nowMs ?? this.clock.now());
+  }
+
+  /** Returns the current MTF confluence result for a symbol */
+  getMtfConfluence(symbol: string, nowMs?: number): MtfConfluenceResult | null {
+    const session = this.sessions.get(normalizeSymbol(symbol));
+    if (!session) return null;
+    return session.mtfConfluence.getConfluence(nowMs ?? this.clock.now());
+  }
+
+  /** Returns the current composite reward breakdown for a symbol */
+  getCompositeReward(symbol: string, nowMs?: number): ReturnType<CompositeRewardFunction['compute']> | null {
+    const session = this.sessions.get(normalizeSymbol(symbol));
+    if (!session) return null;
+    return session.compositeReward.compute(nowMs ?? this.clock.now());
+  }
+
+  /** Returns the best-fitness GA chromosome genes for a symbol */
+  getGABestGenes(symbol: string): GAParamGene | null {
+    const session = this.sessions.get(normalizeSymbol(symbol));
+    if (!session) return null;
+    return session.gaOptimizer.getBestChromosome().genes;
+  }
+
+  /** Returns full GA population stats for a symbol */
+  getGAStatus(symbol: string): { generation: number; totalTrades: number; best: GAParamGene; population: ReturnType<GAParamOptimizer['getPopulation']> } | null {
+    const session = this.sessions.get(normalizeSymbol(symbol));
+    if (!session) return null;
+    const ga = session.gaOptimizer;
+    return {
+      generation: ga.getGeneration(),
+      totalTrades: ga.getTotalTradeCount(),
+      best: ga.getBestChromosome().genes,
+      population: ga.getPopulation(),
+    };
   }
 
   getWarmupExecutionState(symbol: string): {
@@ -1073,8 +1131,17 @@ export class DryRunSessionService {
 
     if (input.trendState) session.trend.state = input.trendState;
     if (Number.isFinite(input.trendConfidence as number)) session.trend.confidence = clampNumber(Number(input.trendConfidence), 0, 0, 1);
-    if (input.bias15m) session.trend.bias15m = input.bias15m;
-    if (input.veto1h) session.trend.veto1h = input.veto1h;
+    if (input.bias15m) {
+      session.trend.bias15m = input.bias15m;
+      // Feed 15m bias into MTF confluence
+      session.mtfConfluence.update('15m', input.bias15m as MtfBias, nowMs);
+    }
+    if (input.veto1h) {
+      session.trend.veto1h = input.veto1h;
+      // Map veto1h → MTF 1h bias (EXHAUSTION treated as NEUTRAL — no clear direction)
+      const veto1hBias: MtfBias = input.veto1h === 'UP' ? 'UP' : input.veto1h === 'DOWN' ? 'DOWN' : 'NEUTRAL';
+      session.mtfConfluence.update('1h', veto1hBias, nowMs);
+    }
     if (Object.prototype.hasOwnProperty.call(input, 'structure')) {
       this.syncStructureRuntimeContext(session, input.structure ?? null);
     }
@@ -1797,6 +1864,18 @@ export class DryRunSessionService {
 
       if (this.alertService && out.log.realizedPnl <= -DEFAULT_LARGE_LOSS_ALERT) {
         this.alertService.send('LARGE_LOSS', `${symbol}: realized PnL ${roundTo(out.log.realizedPnl, 2)} USDT`, 'HIGH');
+      }
+
+      // Feed trade outcome into composite reward + GA optimizer
+      const walletBase = Math.abs(Number(out.log.walletBalanceBefore ?? 0));
+      if (walletBase > 0) {
+        const pnlFraction = out.log.realizedPnl / walletBase;
+        const reward = session.compositeReward.record(pnlFraction, eventTimestampMs);
+        const evolved = session.gaOptimizer.recordTrade(reward.composite);
+        if (evolved && this.onGAEvolution) {
+          const best = session.gaOptimizer.getBestChromosome();
+          this.onGAEvolution(symbol, best.genes, session.gaOptimizer.getGeneration());
+        }
       }
     }
 

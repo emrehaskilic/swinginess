@@ -36,8 +36,11 @@ export function useTelemetrySocket(
     let disposed = false;
     let wsCandidateIndex = 0;
     let noMetricsTimer: number | null = null;
+    // Stale detection: after first metrics received, reconnect if silent for >15s
+    let staleMetricsTimer: number | null = null;
     const maxDelayMs = 30_000;
     const noMetricsTimeoutMs = 10_000;
+    const staleMetricsTimeoutMs = 15_000;
     reconnectAttempts.current = 0;
     const wsCandidates = getProxyWsCandidates();
 
@@ -53,6 +56,22 @@ export function useTelemetrySocket(
         clearTimeout(noMetricsTimer);
         noMetricsTimer = null;
       }
+    };
+
+    const clearStaleMetricsTimer = () => {
+      if (staleMetricsTimer != null) {
+        clearTimeout(staleMetricsTimer);
+        staleMetricsTimer = null;
+      }
+    };
+
+    const resetStaleMetricsTimer = (ws: WebSocket) => {
+      clearStaleMetricsTimer();
+      staleMetricsTimer = window.setTimeout(() => {
+        if (disposed || wsRef.current !== ws) return;
+        console.warn('[Telemetry] No metrics for 15s — reconnecting (stale detection)');
+        try { ws.close(4001, 'stale_metrics'); } catch { /* ignore */ }
+      }, staleMetricsTimeoutMs);
     };
 
     const scheduleReconnect = () => {
@@ -118,6 +137,7 @@ export function useTelemetrySocket(
           onStatusChange?.('open');
           reconnectAttempts.current = 0;
           clearNoMetricsTimer();
+          clearStaleMetricsTimer();
           noMetricsTimer = window.setTimeout(() => {
             if (disposed || wsRef.current !== ws || receivedMetrics) {
               return;
@@ -143,6 +163,15 @@ export function useTelemetrySocket(
           }
           try {
             const msg = JSON.parse(event.data);
+            // Heartbeat from server: proves the server is alive and the WS is working.
+            // Reset the stale timer AND clear the initial no-metrics timer so we don't
+            // rotate candidates or reconnect just because metrics are slow to arrive
+            // (e.g. during Binance WS reconnect / snapshot fetch on the backend).
+            if (msg.type === 'heartbeat' && msg.symbol) {
+              clearNoMetricsTimer();
+              resetStaleMetricsTimer(ws);
+              return;
+            }
             if (msg.type === 'metrics' && msg.symbol) {
               const receivedAt = Date.now();
               const serverSent = Number(msg?.server_sent_ms || 0);
@@ -161,6 +190,8 @@ export function useTelemetrySocket(
                 receivedMetrics = true;
                 clearNoMetricsTimer();
               }
+              // Reset stale timer on every metrics message
+              resetStaleMetricsTimer(ws);
               setState(prev => ({ ...prev, [symbol]: { ...metricsMsg, symbol } }));
             }
           } catch {
@@ -174,6 +205,7 @@ export function useTelemetrySocket(
             wsRef.current = null;
           }
           clearNoMetricsTimer();
+          clearStaleMetricsTimer();
           // Ignore lifecycle events from stale sockets that were intentionally replaced.
           if (disposed || !isCurrentSocket) {
             return;
@@ -224,6 +256,7 @@ export function useTelemetrySocket(
       disposed = true;
       clearReconnectTimer();
       clearNoMetricsTimer();
+      clearStaleMetricsTimer();
       closeActiveSocket('effect_cleanup');
       onStatusChange?.('closed');
     };

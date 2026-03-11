@@ -113,6 +113,28 @@ const RightStatsPanel: React.FC<RightStatsPanelProps> = ({ metrics, showLatency 
           <MetricTile title="CVD Slope" value={lm.cvdSlope.toFixed(2)} valueClassName={posNegClass(lm.cvdSlope)} />
         </div>
       )}
+      {/* CVD Divergence Alert */}
+      {lm && (() => {
+        const vwap = lm.vwap || 0;
+        const price = lm.price || 0;
+        const cvdSlope = lm.cvdSlope;
+        const priceAboveVwap = price > 0 && vwap > 0 && price > vwap;
+        const priceBelowVwap = price > 0 && vwap > 0 && price < vwap;
+        const CVD_THRESH = 0.25;
+        const bearishDiverg = priceAboveVwap && cvdSlope < -CVD_THRESH;
+        const bullishDiverg = priceBelowVwap && cvdSlope > CVD_THRESH;
+        if (!bearishDiverg && !bullishDiverg) return null;
+        return (
+          <div className={`px-2 py-1.5 rounded border-l-2 ${bearishDiverg ? 'bg-red-900/30 border-red-500' : 'bg-green-900/30 border-green-500'}`}>
+            <span className={`text-[10px] font-bold ${bearishDiverg ? 'text-red-400' : 'text-green-400'}`}>
+              {bearishDiverg ? '⚡ BEARISH CVD DIVERG' : '⚡ BULLISH CVD DIVERG'}
+            </span>
+            <span className="text-[9px] text-zinc-400 ml-2">
+              {bearishDiverg ? 'Price↑ CVD↓ — LONG bloke' : 'Price↓ CVD↑ — SHORT bloke'}
+            </span>
+          </div>
+        );
+      })()}
 
       <div className="grid grid-cols-2 gap-2">
         <div className="bg-zinc-800/50 p-2 rounded">
@@ -301,15 +323,27 @@ const RightStatsPanel: React.FC<RightStatsPanelProps> = ({ metrics, showLatency 
         {/* Funding */}
         <div className="bg-zinc-800/50 p-2 rounded">
           <div className="font-semibold text-zinc-400 text-[10px] uppercase">Funding</div>
-          {funding ? (
-            <>
-              <div className="text-sm text-zinc-200">{formatNum(funding.rate, 4)}</div>
-              <div className="text-sm text-zinc-200">{formatTime(funding.timeToFundingMs)}</div>
-              <div className={funding.trend === 'up' ? 'text-green-400' : funding.trend === 'down' ? 'text-red-400' : 'text-zinc-300'}>
-                {funding.trend}
-              </div>
-            </>
-          ) : (
+          {funding ? (() => {
+            const rate = funding.rate;
+            const OVERCROWD = 0.0003;
+            const MILD = 0.0001;
+            const longOvercrowded = rate > OVERCROWD;
+            const shortOvercrowded = rate < -OVERCROWD;
+            const mildLong = !longOvercrowded && rate > MILD;
+            const mildShort = !shortOvercrowded && rate < -MILD;
+            const crowdLabel = longOvercrowded ? 'LONG CROWDED' : shortOvercrowded ? 'SHORT CROWDED' : mildLong ? 'Mild Long' : mildShort ? 'Mild Short' : 'Neutral';
+            const crowdColor = longOvercrowded || shortOvercrowded ? 'text-red-400' : mildLong || mildShort ? 'text-yellow-400' : 'text-green-400';
+            return (
+              <>
+                <div className={`text-sm font-mono font-bold ${posNegClass(rate)}`}>{rate >= 0 ? '+' : ''}{(rate * 100).toFixed(4)}%</div>
+                <div className={`text-[10px] font-bold ${crowdColor}`}>{crowdLabel}</div>
+                <div className="text-[9px] text-zinc-500">{formatTime(funding.timeToFundingMs)} left</div>
+                <div className={`text-[9px] ${funding.trend === 'up' ? 'text-green-400' : funding.trend === 'down' ? 'text-red-400' : 'text-zinc-500'}`}>
+                  {funding.trend === 'up' ? '↑ rising' : funding.trend === 'down' ? '↓ falling' : '— flat'}
+                </div>
+              </>
+            );
+          })() : (
             <div className="text-zinc-500">-</div>
           )}
         </div>

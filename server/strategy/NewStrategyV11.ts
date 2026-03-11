@@ -17,6 +17,7 @@ import type { StructureSnapshot } from '../structure/types';
 import { NormalizationStore } from './Normalization';
 import { DirectionalFlowScore } from './DirectionalFlowScore';
 import { RegimeSelector } from './RegimeSelector';
+import { ProbabilisticRegimeScorer, RegimePosterior } from './ProbabilisticRegimeScorer';
 import { deriveBias15m, deriveVeto1h } from './HtfBias';
 
 const clamp = (v: number, min: number, max: number) => Math.max(min, Math.min(max, v));
@@ -42,6 +43,8 @@ export class NewStrategyV11 {
   private readonly norm: NormalizationStore;
   private readonly dfs: DirectionalFlowScore;
   private readonly regimeSelector: RegimeSelector;
+  private readonly regimeScorer: ProbabilisticRegimeScorer;
+  private lastRegimePosterior: RegimePosterior | null = null;
   private readonly decisionLog?: DecisionLog;
 
   private lastDecisionTs = 0;
@@ -84,7 +87,35 @@ export class NewStrategyV11 {
     this.norm = new NormalizationStore(windowMs, 64);
     this.dfs = new DirectionalFlowScore(this.norm);
     this.regimeSelector = new RegimeSelector(this.norm, this.config.regimeLockTRMRTicks, this.config.regimeLockEVTicks);
+    this.regimeScorer = new ProbabilisticRegimeScorer();
     this.decisionLog = decisionLog;
+  }
+
+  /** Returns the latest probabilistic regime posterior (TR/MR/EV probabilities) */
+  getRegimePosterior(): RegimePosterior | null {
+    return this.lastRegimePosterior;
+  }
+
+  /**
+   * Call after a position closes to update DFS component weights via EMA.
+   * @param side        - closed position side
+   * @param pnlFraction - realized PnL as fraction (e.g. 0.012 = +1.2%)
+   */
+  updateDfsWeightsFromTrade(side: 'LONG' | 'SHORT', pnlFraction: number): void {
+    this.dfs.updateWeightsFromTrade(side, pnlFraction);
+  }
+
+  /**
+   * Patch strategy config at runtime (e.g. from GA optimizer).
+   * Only numeric fields are updated; all other config remains unchanged.
+   */
+  patchConfig(patch: Partial<StrategyConfig>): void {
+    Object.assign(this.config, patch);
+  }
+
+  /** Returns a snapshot of the current config (read-only copy). */
+  getConfig(): Readonly<StrategyConfig> {
+    return { ...this.config };
   }
 
   evaluate(input: StrategyInput): StrategyDecision {
@@ -129,8 +160,17 @@ export class NewStrategyV11 {
       volatility: input.volatility,
     });
 
+    // Probabilistic regime scoring (HMM-inspired Bayesian posterior)
+    this.lastRegimePosterior = this.regimeScorer.update({
+      volLevel: regimeOut.volLevel,
+      trendStrength: Math.abs(dfsOut.dfsPercentile - 0.5) * 2,
+      meanRevScore: regimeOut.scores.meanRevScore,
+      eventScore: regimeOut.scores.eventScore,
+      nowMs,
+    });
+
     const activeRegime = this.resolveActiveRegime(input, regimeOut.regime, dfsOut.dfsPercentile);
-    const thresholds = this.computeThresholds(regimeOut.volLevel);
+    const thresholds = this.computeThresholds(regimeOut.volLevel, activeRegime);
     const actions: StrategyAction[] = [];
 
     this.updateVwapTicks(input.market.price, input.market.vwap);
@@ -232,7 +272,7 @@ export class NewStrategyV11 {
     return this.buildDecision(input, activeRegime, dfsOut, thresholds, gate, actions, reasons);
   }
 
-  private computeThresholds(volLevel: number) {
+  private computeThresholds(volLevel: number, regime?: StrategyRegime) {
     let longEntry = this.config.dfsEntryLongBase;
     let shortEntry = this.config.dfsEntryShortBase;
     const longBreak = this.config.dfsBreakLongBase;
@@ -244,6 +284,12 @@ export class NewStrategyV11 {
     } else if (volLevel < this.config.volLowP) {
       longEntry = 0.80;
       shortEntry = 0.20;
+    }
+
+    // MR regime: tighten DFS thresholds to require stronger edge before entry
+    if (regime === 'MR') {
+      longEntry = Math.max(longEntry, 0.93);
+      shortEntry = Math.min(shortEntry, 0.07);
     }
 
     return { longEntry, shortEntry, longBreak, shortBreak };
@@ -323,6 +369,12 @@ export class NewStrategyV11 {
     thresholds: { longEntry: number; shortEntry: number },
     reasons: DecisionReason[]
   ): StrategyAction | null {
+    // P0-3: EV (Extreme Volatility) rejiminde yeni pozisyon açma — sadece mevcut pozisyonu yönet
+    if (regime === 'EV') {
+      reasons.push('ENTRY_BLOCKED_EV_REGIME');
+      return null;
+    }
+
     if (this.config.structureEnabled && !this.hasFreshStructure(input)) {
       reasons.push(DEFAULT_STRUCTURE_ENTRY_BLOCK_REASON);
       return null;
@@ -412,6 +464,53 @@ export class NewStrategyV11 {
     if (this.shouldBlockEntryByDecisionContext(input)) {
       return null;
     }
+    // P0-1: Funding Rate overcrowding filter — block entries in the crowded direction
+    // High positive funding = overcrowded longs → don't add to crowd, block LONG
+    // High negative funding = overcrowded shorts → block SHORT
+    const fundingRate = input.funding?.rate ?? null;
+    if (fundingRate !== null) {
+      const FUNDING_OVERCROWD_THRESHOLD = Number(this.config.fundingOvercrowdThreshold ?? 0.0003);
+      if (desiredSide === 'LONG' && fundingRate > FUNDING_OVERCROWD_THRESHOLD) {
+        return null; // overcrowded long — institutional approach: don't join the crowd
+      }
+      if (desiredSide === 'SHORT' && fundingRate < -FUNDING_OVERCROWD_THRESHOLD) {
+        return null; // overcrowded short
+      }
+    }
+
+    // CVD 4-Quadrant Framework:
+    //   PASSIVE_BUY_ABSORPTION  → sellers active, buyers absorbing → LONG allowed even against bias
+    //   PASSIVE_SELL_ABSORPTION → buyers active, sellers absorbing → SHORT allowed even against bias
+    //   BUY_EXHAUSTION          → price high, buying fading → block LONG
+    //   SELL_EXHAUSTION         → price low, selling fading → block SHORT
+    //   NEUTRAL                 → no override
+    const cvdQuadrant = this.detectCVDQuadrant(input);
+
+    if (cvdQuadrant === 'BUY_EXHAUSTION' && desiredSide === 'LONG') {
+      return null; // buying momentum fading at top — don't chase
+    }
+    if (cvdQuadrant === 'SELL_EXHAUSTION' && desiredSide === 'SHORT') {
+      return null; // selling momentum fading at bottom — don't chase
+    }
+
+    // Absorpsiyon sinyali: bias karşıt yönde olsa bile izin ver
+    // Sellers being absorbed by institutional buyers → LONG conviction boosted
+    const absorptionOverride =
+      (cvdQuadrant === 'PASSIVE_BUY_ABSORPTION' && desiredSide === 'LONG') ||
+      (cvdQuadrant === 'PASSIVE_SELL_ABSORPTION' && desiredSide === 'SHORT');
+
+    // Original CVD divergence block — only apply when NO absorption override
+    if (!absorptionOverride) {
+      const cvdSlope = input.market.cvdSlope ?? 0;
+      const CVD_DIVERG_THRESHOLD = 0.25;
+      if (desiredSide === 'LONG' && bias15m === 'UP' && cvdSlope < -CVD_DIVERG_THRESHOLD) {
+        return null;
+      }
+      if (desiredSide === 'SHORT' && bias15m === 'DOWN' && cvdSlope > CVD_DIVERG_THRESHOLD) {
+        return null;
+      }
+    }
+
     // MR regime: require stronger microstructure conviction to avoid whipsaw
     if (regime === 'MR') {
       const obiW = input.market.obiWeighted;
@@ -880,6 +979,45 @@ export class NewStrategyV11 {
       return null;
     }
 
+    // Alpha Decay Exit: DFS sinyal gücü giriş anından bu yana önemli ölçüde düştüyse çık
+    // Mikro yapı avantajı (alpha) giriş sonrası üstel olarak çürür.
+    // Giriş DFS'i >= 0.85 iken şimdiki <= (giriş - decay_threshold) düştüyse → soft reduce
+    const entryDfsP = input.position.entryDfsP ?? null;
+    const alphaDfsDecayThreshold = Number(
+      (this.config as Record<string, unknown>).alphaDfsBias15mDecayThreshold ?? 0.35
+    );
+    const alphaDfsDecayMinAgeMs = Number(
+      (this.config as Record<string, unknown>).alphaDfsDecayMinAgeSec ?? 600
+    ) * 1000;
+    if (
+      entryDfsP !== null
+      && positionAgeMs >= alphaDfsDecayMinAgeMs
+      && entryDfsP >= 0.82
+      && unrealizedPnlPct > 0
+    ) {
+      const currentStrength = side === 'LONG' ? dfsP : (1 - dfsP);
+      const entryStrength = side === 'LONG' ? entryDfsP : (1 - entryDfsP);
+      const decay = entryStrength - currentStrength;
+      if (decay >= alphaDfsDecayThreshold) {
+        this.lastSoftReduceTs = input.nowMs;
+        this.lastSoftReduceSide = side;
+        return {
+          type: StrategyActionType.REDUCE,
+          side,
+          reason: 'REDUCE_SOFT',
+          reducePct: 0.35,
+          expectedPrice: input.market.price,
+          metadata: {
+            mode: 'ALPHA_DECAY',
+            entryDfsP,
+            currentDfsP: dfsP,
+            decay: Math.round(decay * 1000) / 1000,
+            positionAgeMs,
+          },
+        };
+      }
+    }
+
     const sideStrength = side === 'LONG' ? dfsP : (1 - dfsP);
     const lastSideStrength = side === 'LONG' ? this.lastDfsPercentile : (1 - this.lastDfsPercentile);
     const weakening = lastSideStrength >= 0.82
@@ -1017,7 +1155,18 @@ export class NewStrategyV11 {
         metadata: { unrealizedPnlPct, partialStop1Pct, stopLossThreshold },
       };
     }
-    if (this.isTrendCarryHoldLocked(input, side) && !confirmedTrendExit) {
+    const lockState = this.isTrendCarryHoldLocked(input, side);
+    if (lockState === 'SOFT_REDUCE_ONLY') {
+      return {
+        type: StrategyActionType.REDUCE,
+        side,
+        reason: 'REDUCE_TREND_CARRY_EARLY_STRUCTURE_BREAK',
+        reducePct: 0.4,
+        expectedPrice: price,
+        metadata: { unrealizedPnlPct, peakPnlPct },
+      };
+    }
+    if (lockState === 'LOCKED' && !confirmedTrendExit) {
       return null;
     }
 
@@ -1137,7 +1286,7 @@ export class NewStrategyV11 {
       return { valid: false, reason: 'HARD_REVERSAL_REJECTED' };
     }
     const side = input.position.side;
-    if (this.isTrendCarryHoldLocked(input, side) || !this.hasConfirmedTrendReversalContext(input, side)) {
+    if (this.isTrendCarryHoldLocked(input, side) !== 'UNLOCKED' || !this.hasConfirmedTrendReversalContext(input, side)) {
       return { valid: false, reason: 'HARD_REVERSAL_REJECTED' };
     }
     const price = input.market.price;
@@ -1462,6 +1611,62 @@ export class NewStrategyV11 {
     return clamp(target / atrPct, 0.5, 1.5);
   }
 
+  // CVD 4-Quadrant framework — detects absorpsiyon (pasif emilim) vs tükenme (exhaustion)
+  // Returns:
+  //   PASSIVE_BUY_ABSORPTION  → sellers active but buyers absorbing → bullish reversal setup
+  //   PASSIVE_SELL_ABSORPTION → buyers active but sellers absorbing → bearish reversal setup
+  //   BUY_EXHAUSTION          → price high but buying momentum fading → LONG veto
+  //   SELL_EXHAUSTION         → price low but selling momentum fading → SHORT veto
+  //   NEUTRAL                 → no strong divergence
+  private detectCVDQuadrant(
+    input: StrategyInput
+  ): 'PASSIVE_BUY_ABSORPTION' | 'PASSIVE_SELL_ABSORPTION' | 'BUY_EXHAUSTION' | 'SELL_EXHAUSTION' | 'NEUTRAL' {
+    const cvdSlope = input.market.cvdSlope ?? 0;
+    const deltaZ = input.market.deltaZ ?? 0;
+    const price = input.market.price;
+    const vwap = input.market.vwap;
+    if (!(price > 0) || !(vwap > 0)) return 'NEUTRAL';
+
+    const priceAboveVwap = price > vwap;
+    const priceBelowVwap = price < vwap;
+
+    // Strong CVD signal thresholds
+    const ABS_THRESHOLD = 0.5;    // High conviction — sellers/buyers very active
+    const EXHAUS_THRESHOLD = 0.25; // Moderate — momentum fading
+
+    // PASSIVE BUY ABSORPTION:
+    // Price is depressed (below VWAP) AND CVD slope is strongly negative (lots of selling)
+    // BUT instantaneous delta (deltaZ) is positive → buyers stepping in, absorbing sellers
+    // → Bullish reversal: sellers running out of steam against institutional buyers
+    if (priceBelowVwap && cvdSlope < -ABS_THRESHOLD && deltaZ > 0) {
+      return 'PASSIVE_BUY_ABSORPTION';
+    }
+
+    // PASSIVE SELL ABSORPTION:
+    // Price is elevated (above VWAP) AND CVD slope is strongly positive (lots of buying)
+    // BUT instantaneous delta (deltaZ) is negative → sellers absorbing buyers at resistance
+    // → Bearish reversal: buyers running out of steam against institutional sellers
+    if (priceAboveVwap && cvdSlope > ABS_THRESHOLD && deltaZ < 0) {
+      return 'PASSIVE_SELL_ABSORPTION';
+    }
+
+    // BUY EXHAUSTION:
+    // Price at highs (above VWAP) but CVD slope turning negative with negative deltaZ
+    // → Buying pressure fading at top → LONG veto, potential short setup
+    if (priceAboveVwap && cvdSlope < -EXHAUS_THRESHOLD && deltaZ < -0.3) {
+      return 'BUY_EXHAUSTION';
+    }
+
+    // SELL EXHAUSTION:
+    // Price at lows (below VWAP) but CVD slope turning positive with positive deltaZ
+    // → Selling pressure fading at bottom → SHORT veto, potential long setup
+    if (priceBelowVwap && cvdSlope > EXHAUS_THRESHOLD && deltaZ > 0.3) {
+      return 'SELL_EXHAUSTION';
+    }
+
+    return 'NEUTRAL';
+  }
+
   private isTrendCarryEarlyStructureBreaking(input: StrategyInput, side: StrategySide): boolean {
     const ageMs = this.getPositionAgeMs(input);
     if (ageMs === null) return false;
@@ -1616,11 +1821,14 @@ export class NewStrategyV11 {
     return this.isOpposingTrendState(side, trendState) && this.adverseTrendBuckets >= this.getTrendReversalConfirmBars();
   }
 
-  private isTrendCarryHoldLocked(input: StrategyInput, side: StrategySide): boolean {
+  private isTrendCarryHoldLocked(input: StrategyInput, side: StrategySide): 'LOCKED' | 'SOFT_REDUCE_ONLY' | 'UNLOCKED' {
     const ageMs = this.getPositionAgeMs(input);
-    if (ageMs === null) return false;
-    if (ageMs >= this.getTrendCarryMinHoldMs()) return false;
-    return this.isAlignedTrendState(side, this.getRuntimeTrendState(input));
+    if (ageMs === null) return 'UNLOCKED';
+    if (ageMs >= this.getTrendCarryMinHoldMs()) return 'UNLOCKED';
+    if (!this.isAlignedTrendState(side, this.getRuntimeTrendState(input))) return 'UNLOCKED';
+    // After 3 min, if structure is already breaking, allow soft reduce only (not full lock)
+    if (this.isTrendCarryEarlyStructureBreaking(input, side)) return 'SOFT_REDUCE_ONLY';
+    return 'LOCKED';
   }
 
   private getPeakPnlPct(input: StrategyInput): number {

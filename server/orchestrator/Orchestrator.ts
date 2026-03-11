@@ -5,6 +5,7 @@ import { DryRunExecutor } from '../execution/DryRunExecutor';
 import { IExecutor } from '../execution/types';
 import { TradeLogger } from '../logger/TradeLogger';
 import { FundingRateMonitor } from '../metrics/FundingRateMonitor';
+import { LiquidationHeatmap, LiquidationHeatmapSnapshot } from '../metrics/LiquidationHeatmap';
 import { AlertService } from '../notifications/AlertService';
 import { SymbolCapitalConfig, materializeSymbolCapitalConfigs } from '../types/capital';
 import { logger } from '../utils/logger';
@@ -54,9 +55,14 @@ export class Orchestrator {
   private readonly tradeLogger: TradeLogger;
   private readonly dryRunOnly: boolean;
   private readonly fundingRateMonitor = new FundingRateMonitor();
+  private readonly liquidationHeatmaps = new Map<string, LiquidationHeatmap>();
   private readonly fundingLastUpdateBySymbol = new Map<string, number>();
   private readonly fundingRefreshMs = Number(process.env.FUNDING_REFRESH_MS || 60_000);
   private readonly limitTimeoutMs = Number(process.env.LIMIT_ORDER_TIMEOUT_MS || 30_000);
+  /** POST_ONLY entry timeout: cancel without fallback if not filled in time */
+  private readonly entryLimitTimeoutMs = Number(process.env.ENTRY_LIMIT_TIMEOUT_MS || 5_000);
+  /** POST_ONLY soft-exit timeout: fallback to MARKET if not filled in time */
+  private readonly exitLimitTimeoutMs = Number(process.env.EXIT_LIMIT_TIMEOUT_MS || 8_000);
   private orderMonitorTimer: NodeJS.Timeout | null = null;
 
   private killSwitch = false;
@@ -237,6 +243,31 @@ export class Orchestrator {
 
   setKillSwitch(enabled: boolean) {
     this.killSwitch = Boolean(enabled);
+  }
+
+  /** Ingest a raw Binance forceOrder WebSocket message for a symbol */
+  ingestLiquidationEvent(rawMsg: unknown): void {
+    try {
+      const msg = rawMsg as Record<string, unknown>;
+      const o = msg['o'] as Record<string, unknown> | undefined;
+      const symbol = String(o?.['s'] ?? '').toUpperCase();
+      if (!symbol) return;
+      let heatmap = this.liquidationHeatmaps.get(symbol);
+      if (!heatmap) {
+        heatmap = new LiquidationHeatmap(symbol);
+        this.liquidationHeatmaps.set(symbol, heatmap);
+      }
+      heatmap.parseAndIngest(rawMsg, Date.now());
+    } catch {
+      // Malformed message — ignore
+    }
+  }
+
+  /** Get liquidation heatmap snapshot for a symbol at the given price */
+  getLiquidationSnapshot(symbol: string, currentPrice: number): LiquidationHeatmapSnapshot | null {
+    const heatmap = this.liquidationHeatmaps.get(symbol.toUpperCase());
+    if (!heatmap) return null;
+    return heatmap.snapshot(currentPrice, Date.now());
   }
 
   ingest(metrics: OrchestratorMetricsInput) {
@@ -542,12 +573,16 @@ export class Orchestrator {
       exchange_event_time_ms: exchangeTime,
       metrics,
     }, this.config.gate);
+    const fundingInfo = this.fundingRateMonitor.get(symbol);
+    const fundingEnriched = fundingInfo
+      ? { rate: fundingInfo.fundingRate, timeToFundingMs: fundingInfo.nextFundingTime - Date.now() }
+      : (metrics.funding ?? null);
     return {
       kind: 'metrics',
       symbol,
       canonical_time_ms: canonicalTime,
       exchange_event_time_ms: exchangeTime,
-      metrics: { ...metrics, symbol },
+      metrics: { ...metrics, symbol, funding: fundingEnriched },
       gate,
     };
   }
@@ -1180,7 +1215,11 @@ export class Orchestrator {
         continue;
       }
 
-      const orderType: OrderType = action.type === 'EXIT_MARKET' ? 'MARKET' : 'LIMIT';
+      // Classify order: entries/adds → POST_ONLY maker; hard exits → MARKET; soft exits → POST_ONLY maker
+      const isEntry = action.type === 'ENTRY_PROBE' || action.type === 'ADD_POSITION';
+      const isSoftExit = action.type === 'EXIT_MARKET' && this.isSoftExitReason(action.reason);
+      const isHardExit = action.type === 'EXIT_MARKET' && !isSoftExit;
+      const orderType: OrderType = isHardExit ? 'MARKET' : 'LIMIT';
       const makerPrice = orderType === 'LIMIT' ? this.getMakerLimitPrice(symbol, side) : null;
       const requestPrice = orderType === 'LIMIT'
         ? (makerPrice && makerPrice > 0 ? makerPrice : price)
@@ -1215,6 +1254,25 @@ export class Orchestrator {
             sentAtMs: Date.now(),
             tag,
           });
+          // Register POST_ONLY limit orders with OrderMonitor for timeout handling
+          if (orderType === 'LIMIT') {
+            const timeoutMs = isEntry ? this.entryLimitTimeoutMs : this.exitLimitTimeoutMs;
+            const role = action.type === 'ADD_POSITION' ? 'SCALE_IN' : isSoftExit ? 'FLATTEN' : 'BOOT_PROBE';
+            this.orderMonitor.register({
+              orderId: res.orderId,
+              clientOrderId,
+              symbol,
+              side,
+              price: requestPrice,
+              qty: sizingQty,
+              reduceOnly,
+              role,
+              createdAtMs: Date.now(),
+              timeoutMs,
+              // Entries: cancel-only on timeout (stale signal); exits: fallback to MARKET
+              noMarketFallback: isEntry,
+            });
+          }
         }
       } catch (e: any) {
         const msg = e?.message || 'execution_failed';
@@ -1355,6 +1413,49 @@ export class Orchestrator {
       });
       return null;
     }
+  }
+
+  // IOC taker limit price: crosses the spread aggressively to guarantee immediate fill
+  // BUY → bestAsk + buffer (price cap); SELL → bestBid − buffer (price floor)
+  // Ensures fill like a market order while bounding worst-case slippage
+  private getTakerLimitPrice(symbol: string, side: Side): number | null {
+    const bufferBps = Number(process.env.LIMIT_REPRICE_BUFFER_BPS || this.config.plan.limitBufferBps || 2);
+    const quote = this.connector.getQuote(symbol);
+    if (quote && Number.isFinite(quote.bestBid) && Number.isFinite(quote.bestAsk)) {
+      if (side === 'BUY') {
+        return quote.bestAsk > 0 ? quote.bestAsk * (1 + bufferBps / 10_000) : null;
+      }
+      return quote.bestBid > 0 ? quote.bestBid * (1 - bufferBps / 10_000) : null;
+    }
+    const fallback = this.connector.expectedPrice(symbol, side, 'MARKET');
+    if (!(typeof fallback === 'number' && Number.isFinite(fallback) && fallback > 0)) {
+      return null;
+    }
+    const buffer = fallback * (bufferBps / 10_000);
+    return side === 'BUY' ? fallback + buffer : fallback - buffer;
+  }
+
+  /**
+   * Returns true for soft position management exits that can safely use POST_ONLY maker orders.
+   * Hard stops, emergency exits, and reversals always use MARKET to guarantee fill.
+   */
+  private isSoftExitReason(reason?: string): boolean {
+    if (!reason) return false;
+    const r = reason.toUpperCase();
+    // Hard exits and emergencies — keep as MARKET
+    if (
+      r.includes('HARD') || r.includes('STOP') || r.includes('REVERSAL') ||
+      r.includes('LOSS') || r.includes('EMERGENCY') || r.includes('REDUCE_SOFT')
+    ) return false;
+    // Soft exit categories that are safe to pend as POST_ONLY
+    return (
+      r.startsWith('ALPHA_DECAY') ||
+      r.includes('TREND_CARRY_REDUCE') ||
+      r.includes('TREND_CARRY_EARLY') ||
+      r.includes('MR_FLAT') ||
+      r.includes('DFS_DIVERGENCE') ||
+      r.includes('TIMEOUT_EXIT')
+    );
   }
 
   private getMakerLimitPrice(symbol: string, side: Side): number | null {

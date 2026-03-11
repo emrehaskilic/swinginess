@@ -119,9 +119,17 @@ export class LegacyCalculator {
     private volatilityHistory: number[] = [];
     private volumeHistory: number[] = [];
     private lastMidPrice = 0;
-    
+
     // [P0-FIX-09] Last valid VWAP for deterministic fallback
     private lastValidVwap: number = 0;
+
+    // --- OFI (Order Flow Imbalance) state ---
+    // Tracks delta changes in the order book between consecutive ticks.
+    // OFI = Σ(bid additions - bid cancellations) - Σ(ask additions - ask cancellations)
+    // Rolling window of OFI values for normalization
+    private prevOBLevels: { bids: Map<number, number>; asks: Map<number, number> } | null = null;
+    private ofiHistory: number[] = [];
+    private readonly OFI_HISTORY_LIMIT = 60;
 
     constructor(symbol?: string) {
         if (symbol) {
@@ -397,6 +405,43 @@ export class LegacyCalculator {
             vwap = this.lastValidVwap;
         }
 
+        // --- OFI (Order Flow Imbalance) ---
+        // Measures limit order additions/cancellations vs previous snapshot.
+        // Positive = net buy-side pressure; negative = net sell-side pressure.
+        const currentBidMap = new Map<number, number>(sortedBids);
+        const currentAskMap = new Map<number, number>(sortedAsks);
+
+        let ofi = 0;
+        if (this.prevOBLevels !== null) {
+          const allBidPrices = new Set([...currentBidMap.keys(), ...this.prevOBLevels.bids.keys()]);
+          for (const p of allBidPrices) {
+            const cur = currentBidMap.get(p) ?? 0;
+            const prev = this.prevOBLevels.bids.get(p) ?? 0;
+            ofi += cur - prev; // positive = bid volume grew (buying intent)
+          }
+          const allAskPrices = new Set([...currentAskMap.keys(), ...this.prevOBLevels.asks.keys()]);
+          for (const p of allAskPrices) {
+            const cur = currentAskMap.get(p) ?? 0;
+            const prev = this.prevOBLevels.asks.get(p) ?? 0;
+            ofi -= cur - prev; // negative contribution = ask volume grew (selling intent)
+          }
+        }
+        // Save current snapshot for next tick
+        this.prevOBLevels = { bids: currentBidMap, asks: currentAskMap };
+
+        // Normalize OFI: keep rolling history, output z-score in [-1, 1]
+        this.ofiHistory.push(ofi);
+        if (this.ofiHistory.length > this.OFI_HISTORY_LIMIT) this.ofiHistory.shift();
+        let ofiNormalized = 0;
+        if (this.ofiHistory.length >= 3) {
+          const { std, mean } = calculateStdDevDeterministic(this.ofiHistory);
+          ofiNormalized = std > EPSILON
+            ? sanitizeFinite((ofi - mean) / std, 0)
+            : 0;
+          // Soft clamp to [-3, 3] then rescale to [-1, 1]
+          ofiNormalized = Math.max(-3, Math.min(3, ofiNormalized)) / 3;
+        }
+
         // Compose object
         const bestBidPrice = sortedBids.length > 0 ? sortedBids[0][0] : 0;
         const bestAskPrice = sortedAsks.length > 0 ? sortedAsks[0][0] : 0;
@@ -408,6 +453,7 @@ export class LegacyCalculator {
             obiWeighted: sanitizeFinite(obiWeighted, 0),
             obiDeep: sanitizeFinite(obiDeep, 0),
             obiDivergence: sanitizeFinite(obiDivergence, 0),
+            ofiNormalized: sanitizeFinite(ofiNormalized, 0),
             delta1s: sanitizeFinite(delta1s, 0),
             delta5s: sanitizeFinite(delta5s, 0),
             deltaZ: sanitizeFinite(deltaZ, 0),
