@@ -58,6 +58,9 @@ export type DecisionReason =
   | 'EXIT_HARD_REVERSAL'
   | 'HARD_REVERSAL_ENTRY'
   | 'HARD_REVERSAL_REJECTED'
+  | 'ENTRY_EXHAUSTION_FADE'
+  | 'ENTRY_TREND_PULLBACK'
+  | 'EXIT_FLOW_REVERSAL'
   | 'NO_SIGNAL'
   | 'NOOP';
 
@@ -134,7 +137,7 @@ export type AuctionAcceptance =
 export type LiquidityQuality = 'GOOD' | 'THIN' | 'TOXIC' | 'BLOCKED';
 export type ManipulationRiskLevel = 'LOW' | 'MEDIUM' | 'HIGH';
 export type ExecutionQualityLevel = 'GOOD' | 'DEGRADED' | 'BLOCKED';
-export type EntrySetupKind = 'TREND_CONTINUATION' | 'BREAKOUT_ACCEPTANCE' | 'AUCTION_REVERSION';
+export type EntrySetupKind = 'TREND_CONTINUATION' | 'BREAKOUT_ACCEPTANCE' | 'AUCTION_REVERSION' | 'EXHAUSTION_FADE' | 'TREND_PULLBACK_RELOAD';
 
 export interface SessionProfileSnapshot {
   sessionName: 'asia' | 'london' | 'ny';

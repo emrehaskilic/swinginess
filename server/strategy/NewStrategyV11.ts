@@ -81,6 +81,17 @@ export class NewStrategyV11 {
     entryPrice: number;
   }>();
 
+  // ─── DFS Peak/Trough tracker for Exhaustion Fade & Trend Pullback setups ───
+  // Rolling window of DFS percentile samples (last 120 seconds / ~120 ticks)
+  private dfsRollingWindow: { ts: number; dfsP: number }[] = [];
+  private readonly DFS_ROLLING_WINDOW_MS = 120_000; // 2 minutes lookback
+  // Track whether DFS peak/trough condition was met (arm) and then triggered
+  private exhaustionFadeArmed = false;   // DFS >= 0.90 peak seen
+  private exhaustionFadeArmTs = 0;
+  private trendPullbackArmed = false;    // DFS <= 0.10 trough seen
+  private trendPullbackArmTs = 0;
+  private readonly SETUP_ARM_EXPIRY_MS = 60_000; // armed state expires after 60s
+
   constructor(config?: Partial<StrategyConfig>, decisionLog?: DecisionLog) {
     this.config = { ...defaultStrategyConfig, ...(config || {}) };
     const windowMs = Math.max(60_000, this.config.rollingWindowMin * 60_000);
@@ -175,6 +186,7 @@ export class NewStrategyV11 {
 
     this.updateVwapTicks(input.market.price, input.market.vwap);
     this.updateTrendDecisionState(input);
+    this.updateDfsRollingWindow(nowMs, dfsOut.dfsPercentile);
 
     if (gate.passed) {
       this.lastDecisionTs = nowMs;
@@ -286,11 +298,9 @@ export class NewStrategyV11 {
       shortEntry = 0.20;
     }
 
-    // MR regime: tighten DFS thresholds to require stronger edge before entry
-    if (regime === 'MR') {
-      longEntry = Math.max(longEntry, 0.93);
-      shortEntry = Math.min(shortEntry, 0.07);
-    }
+    // MR: Exhaustion Fade setup has its own trigger logic (DFS peak → drop)
+    // No need to tighten DFS thresholds — the setup handles conviction internally
+    // TR: Pullback entries don't use traditional DFS threshold crossing
 
     return { longEntry, shortEntry, longBreak, shortBreak };
   }
@@ -400,15 +410,22 @@ export class NewStrategyV11 {
     }
 
     this.lastEntryTs = input.nowMs;
+    const entryReason: DecisionReason = setupKind === 'EXHAUSTION_FADE'
+      ? 'ENTRY_EXHAUSTION_FADE'
+      : setupKind === 'TREND_PULLBACK_RELOAD'
+        ? 'ENTRY_TREND_PULLBACK'
+        : regime === 'EV' ? 'ENTRY_EV' : regime === 'MR' ? 'ENTRY_MR' : 'ENTRY_TR';
     return {
       type: StrategyActionType.ENTRY,
       side: desiredSide,
-      reason: regime === 'EV' ? 'ENTRY_EV' : regime === 'MR' ? 'ENTRY_MR' : 'ENTRY_TR',
+      reason: entryReason,
       expectedPrice: input.market.price,
       sizeMultiplier: this.getEntrySizeMultiplier(input, setupKind),
       metadata: {
         setupKind,
         contextQuality: input.decisionContext?.execution.quality ?? null,
+        exhaustionFadeArmed: setupKind === 'EXHAUSTION_FADE' ? this.exhaustionFadeArmed : undefined,
+        trendPullbackArmed: setupKind === 'TREND_PULLBACK_RELOAD' ? this.trendPullbackArmed : undefined,
       },
     };
   }
@@ -422,20 +439,42 @@ export class NewStrategyV11 {
     const bias15m = this.bias15m(input);
     const veto1h = this.veto1h(input);
     const context = this.getDecisionContext(input);
-    if (bias15m === 'UP' && veto1h !== 'DOWN' && this.isStructureEntryAligned(input, 'LONG')) {
-      return 'LONG';
+
+    // ─── SETUP 1: Exhaustion Fade (primarily MR) ───
+    // SHORT: DFS peaked >= 0.90, now dropped < 0.70, CVD Slope < 0, OBI Deep < -0.20
+    // LONG:  DFS troughed <= 0.10, now risen > 0.30, CVD Slope > 0, OBI Deep > 0.20
+    if (regime === 'MR') {
+      const shortFade = this.checkExhaustionFadeShort(input, dfsP, context);
+      if (shortFade && veto1h !== 'UP') return 'SHORT';
+      const longFade = this.checkExhaustionFadeLong(input, dfsP, context);
+      if (longFade && veto1h !== 'DOWN') return 'LONG';
     }
-    if (bias15m === 'DOWN' && veto1h !== 'UP' && this.isStructureEntryAligned(input, 'SHORT')) {
-      return 'SHORT';
+
+    // ─── SETUP 2: Trend Pullback & Reload (primarily TR) ───
+    // LONG:  Trend UP, price near VWAP/VAL, DFS dipped <= 0.10, now DeltaZ > 0 & DFS > 0.30
+    // SHORT: Trend DOWN, price near VWAP/VAH, DFS spiked >= 0.90, now DeltaZ < 0 & DFS < 0.70
+    if (regime === 'TR') {
+      const longPullback = this.checkTrendPullbackLong(input, dfsP, context);
+      if (longPullback && bias15m === 'UP' && veto1h !== 'DOWN') return 'LONG';
+      const shortPullback = this.checkTrendPullbackShort(input, dfsP, context);
+      if (shortPullback && bias15m === 'DOWN' && veto1h !== 'UP') return 'SHORT';
     }
-    if (bias15m === 'NEUTRAL' && context?.preferredSetup === 'AUCTION_REVERSION') {
-      if (this.isStructureEntryAligned(input, 'LONG') && this.allowNeutralBiasContinuation(input, 'LONG', dfsP, regime, thresholds)) {
+
+    // Legacy fallback: if none of the two setups fire, allow structure-aligned
+    // trend continuation with original logic (but NOT breakout chasing)
+    if (regime === 'TR') {
+      // TR: only pullback entries near VWAP — never breakout buying
+      const price = input.market.price;
+      const vwap = input.market.vwap;
+      const nearVwap = vwap > 0 && Math.abs(price - vwap) / vwap < 0.004;
+      if (nearVwap && bias15m === 'UP' && veto1h !== 'DOWN' && this.isStructureEntryAligned(input, 'LONG')) {
         return 'LONG';
       }
-      if (this.isStructureEntryAligned(input, 'SHORT') && this.allowNeutralBiasContinuation(input, 'SHORT', dfsP, regime, thresholds)) {
+      if (nearVwap && bias15m === 'DOWN' && veto1h !== 'UP' && this.isStructureEntryAligned(input, 'SHORT')) {
         return 'SHORT';
       }
     }
+
     return null;
   }
 
@@ -448,87 +487,68 @@ export class NewStrategyV11 {
     thresholds: { longEntry: number; shortEntry: number },
     desiredSide: StrategySide
   ): EntrySetupKind | null {
-    const bias15m = this.bias15m(input);
-    const veto1h = this.veto1h(input);
-    if (bias15m !== 'NEUTRAL') {
-      if (desiredSide === 'LONG' && (bias15m !== 'UP' || veto1h === 'DOWN')) {
-        return null;
-      }
-      if (desiredSide === 'SHORT' && (bias15m !== 'DOWN' || veto1h === 'UP')) {
-        return null;
-      }
-    }
-    if (!this.isStructureEntryAligned(input, desiredSide)) {
-      return null;
-    }
     if (this.shouldBlockEntryByDecisionContext(input)) {
       return null;
     }
-    // P0-1: Funding Rate overcrowding filter — block entries in the crowded direction
-    // High positive funding = overcrowded longs → don't add to crowd, block LONG
-    // High negative funding = overcrowded shorts → block SHORT
+
+    // Funding Rate overcrowding filter
     const fundingRate = input.funding?.rate ?? null;
     if (fundingRate !== null) {
-      const FUNDING_OVERCROWD_THRESHOLD = Number(this.config.fundingOvercrowdThreshold ?? 0.0003);
-      if (desiredSide === 'LONG' && fundingRate > FUNDING_OVERCROWD_THRESHOLD) {
-        return null; // overcrowded long — institutional approach: don't join the crowd
+      const FUNDING_OVERCROWD_THRESHOLD = Number((this.config as any).fundingOvercrowdThreshold ?? 0.0003);
+      if (desiredSide === 'LONG' && fundingRate > FUNDING_OVERCROWD_THRESHOLD) return null;
+      if (desiredSide === 'SHORT' && fundingRate < -FUNDING_OVERCROWD_THRESHOLD) return null;
+    }
+
+    const context = this.getDecisionContext(input);
+
+    // ─── SETUP 1: Exhaustion Fade (MR) ───
+    if (regime === 'MR') {
+      if (desiredSide === 'SHORT' && this.checkExhaustionFadeShort(input, dfsP, context)) {
+        return 'EXHAUSTION_FADE';
       }
-      if (desiredSide === 'SHORT' && fundingRate < -FUNDING_OVERCROWD_THRESHOLD) {
-        return null; // overcrowded short
+      if (desiredSide === 'LONG' && this.checkExhaustionFadeLong(input, dfsP, context)) {
+        return 'EXHAUSTION_FADE';
       }
     }
 
-    // CVD 4-Quadrant Framework:
-    //   PASSIVE_BUY_ABSORPTION  → sellers active, buyers absorbing → LONG allowed even against bias
-    //   PASSIVE_SELL_ABSORPTION → buyers active, sellers absorbing → SHORT allowed even against bias
-    //   BUY_EXHAUSTION          → price high, buying fading → block LONG
-    //   SELL_EXHAUSTION         → price low, selling fading → block SHORT
-    //   NEUTRAL                 → no override
+    // ─── SETUP 2: Trend Pullback & Reload (TR) ───
+    if (regime === 'TR') {
+      if (desiredSide === 'LONG' && this.checkTrendPullbackLong(input, dfsP, context)) {
+        return 'TREND_PULLBACK_RELOAD';
+      }
+      if (desiredSide === 'SHORT' && this.checkTrendPullbackShort(input, dfsP, context)) {
+        return 'TREND_PULLBACK_RELOAD';
+      }
+    }
+
+    // ─── Legacy: Trend continuation at VWAP pullback (no breakout chasing) ───
     const cvdQuadrant = this.detectCVDQuadrant(input);
+    if (cvdQuadrant === 'BUY_EXHAUSTION' && desiredSide === 'LONG') return null;
+    if (cvdQuadrant === 'SELL_EXHAUSTION' && desiredSide === 'SHORT') return null;
 
-    if (cvdQuadrant === 'BUY_EXHAUSTION' && desiredSide === 'LONG') {
-      return null; // buying momentum fading at top — don't chase
-    }
-    if (cvdQuadrant === 'SELL_EXHAUSTION' && desiredSide === 'SHORT') {
-      return null; // selling momentum fading at bottom — don't chase
-    }
-
-    // Absorpsiyon sinyali: bias karşıt yönde olsa bile izin ver
-    // Sellers being absorbed by institutional buyers → LONG conviction boosted
     const absorptionOverride =
       (cvdQuadrant === 'PASSIVE_BUY_ABSORPTION' && desiredSide === 'LONG') ||
       (cvdQuadrant === 'PASSIVE_SELL_ABSORPTION' && desiredSide === 'SHORT');
 
-    // Original CVD divergence block — only apply when NO absorption override
     if (!absorptionOverride) {
       const cvdSlope = input.market.cvdSlope ?? 0;
+      const bias15m = this.bias15m(input);
       const CVD_DIVERG_THRESHOLD = 0.25;
-      if (desiredSide === 'LONG' && bias15m === 'UP' && cvdSlope < -CVD_DIVERG_THRESHOLD) {
-        return null;
-      }
-      if (desiredSide === 'SHORT' && bias15m === 'DOWN' && cvdSlope > CVD_DIVERG_THRESHOLD) {
-        return null;
-      }
+      if (desiredSide === 'LONG' && bias15m === 'UP' && cvdSlope < -CVD_DIVERG_THRESHOLD) return null;
+      if (desiredSide === 'SHORT' && bias15m === 'DOWN' && cvdSlope > CVD_DIVERG_THRESHOLD) return null;
     }
 
-    // MR regime: require stronger microstructure conviction to avoid whipsaw
-    if (regime === 'MR') {
-      const obiW = input.market.obiWeighted;
-      const deltaZ = input.market.deltaZ;
-      const longOk = obiW > 0.15 && deltaZ > 1.5 && dfsP > 0.75;
-      const shortOk = obiW < -0.15 && deltaZ < -1.5 && dfsP < 0.25;
-      if ((desiredSide === 'LONG' && !longOk) || (desiredSide === 'SHORT' && !shortOk)) {
-        return null;
-      }
+    // TR: only pullback entries (never breakout) → require price near VWAP
+    if (regime === 'TR') {
+      const price = input.market.price;
+      const vwap = input.market.vwap;
+      if (vwap > 0 && Math.abs(price - vwap) / vwap > 0.005) return null; // too far from VWAP
+      // Require OBI/CVD alignment for pullback entry
+      if (desiredSide === 'LONG' && (input.market.obiWeighted < 0 || input.market.cvdSlope < -0.15)) return null;
+      if (desiredSide === 'SHORT' && (input.market.obiWeighted > 0 || input.market.cvdSlope > 0.15)) return null;
     }
-    const setupKind = this.resolveEntrySetupKind(input, desiredSide);
-    if (setupKind === 'BREAKOUT_ACCEPTANCE') {
-      return this.allowBreakoutAcceptanceEntry(input, desiredSide, dfsP, thresholds) ? setupKind : null;
-    }
-    if (setupKind === 'AUCTION_REVERSION') {
-      return this.allowAuctionReversionEntry(input, desiredSide, dfsP, regime, thresholds) ? setupKind : null;
-    }
-    return this.allowTrendCarryEntry(input, desiredSide, dfsP, thresholds) ? setupKind : null;
+
+    return this.allowTrendCarryEntry(input, desiredSide, dfsP, thresholds) ? 'TREND_CONTINUATION' : null;
   }
 
   private isLiquidTrendContext(input: StrategyInput): boolean {
@@ -877,188 +897,40 @@ export class NewStrategyV11 {
     ) {
       return null;
     }
-    const bias15m = this.bias15m(input);
-    const veto1h = this.veto1h(input);
-    const positionAgeMs = this.getPositionAgeMs(input) ?? 0;
-    const trendAligned = this.isTrendAligned(side, bias15m, veto1h);
-    const htfOpposes = this.isHtfOpposing(side, bias15m, veto1h);
-    const confirmedTrendExit = this.hasConfirmedTrendExitContext(input, side);
-    const softReduceRequireProfit = this.config.softReduceRequireProfit ?? true;
     const unrealizedPnlPct = input.position.unrealizedPnlPct ?? 0;
-    const peakPnlPct = this.getPeakPnlPct(input);
-    const givebackPct = this.getProfitGivebackPct(input);
-    const carryReduceArmed = peakPnlPct >= this.getTrendCarryReduceMinPeakPnlPct();
-    const carryReduceTriggered = carryReduceArmed && givebackPct >= this.getVolAdjustedGivebackPct(this.getTrendCarryReduceGivebackPct(), input);
-    const structureInvalidation = this.isStructureInvalidated(input, side);
+    if (unrealizedPnlPct <= 0) return null; // sadece kârdayken soft reduce
+
     const context = this.getDecisionContext(input);
-    const stillHoldingTrendWinner = trendAligned
-      && carryReduceArmed
-      && !carryReduceTriggered
-      && unrealizedPnlPct >= Math.max(0.003, peakPnlPct * 0.45);
-    if (softReduceRequireProfit && unrealizedPnlPct <= 0) return null;
+
+    // Manipülasyon/toxic likidite koruması — kârı koru
     if (
       context
-      && (
-        context.manipulation.risk === 'HIGH'
-        || context.liquidity.quality === 'TOXIC'
-        || this.isAuctionReversionAgainstPosition(input, side)
-      )
-      && unrealizedPnlPct > 0
+      && (context.manipulation.risk === 'HIGH' || context.liquidity.quality === 'TOXIC')
     ) {
       this.lastSoftReduceTs = input.nowMs;
       this.lastSoftReduceSide = side;
       return {
-        type: StrategyActionType.REDUCE,
-        side,
-        reason: 'REDUCE_SOFT',
-        reducePct: context.execution.quality === 'DEGRADED' ? 0.35 : 0.5,
-        expectedPrice: input.market.price,
-        metadata: {
-          mode: 'CONTEXT_PROTECT',
-          manipulationRisk: context.manipulation.risk,
-          liquidityQuality: context.liquidity.quality,
-          auctionAcceptance: context.auction.acceptance,
-        },
+        type: StrategyActionType.REDUCE, side, reason: 'REDUCE_SOFT',
+        reducePct: 0.5, expectedPrice: input.market.price,
+        metadata: { mode: 'CONTEXT_PROTECT', manipulationRisk: context.manipulation.risk },
       };
     }
-    if (structureInvalidation && unrealizedPnlPct > 0) {
+
+    // Yapı kırılımı — akış teyitli
+    const structureInvalidation = this.isStructureInvalidated(input, side);
+    if (structureInvalidation) {
+      const bias15m = this.bias15m(input);
+      const veto1h = this.veto1h(input);
+      const trendAligned = this.isTrendAligned(side, bias15m, veto1h);
       this.lastSoftReduceTs = input.nowMs;
       this.lastSoftReduceSide = side;
       return {
-        type: StrategyActionType.REDUCE,
-        side,
-        reason: 'REDUCE_SOFT',
-        reducePct: trendAligned ? 0.35 : 0.5,
-        expectedPrice: input.market.price,
-        metadata: {
-          unrealizedPnlPct,
-          peakPnlPct,
-          givebackPct,
-          structureInvalidation: true,
-          mode: 'STRUCTURE_INVALIDATION',
-        },
-      };
-    }
-    if (htfOpposes) {
-      if (!confirmedTrendExit) return null;
-      if (stillHoldingTrendWinner && positionAgeMs < (18 * 3 * 60 * 1000)) {
-        return null;
-      }
-      this.lastSoftReduceTs = input.nowMs;
-      this.lastSoftReduceSide = side;
-      return {
-        type: StrategyActionType.REDUCE,
-        side,
-        reason: 'REDUCE_SOFT',
-        reducePct: carryReduceTriggered ? 0.5 : 0.35,
-          expectedPrice: input.market.price,
-          metadata: {
-            unrealizedPnlPct,
-            peakPnlPct,
-            givebackPct,
-            carryReduceTriggered,
-            mode: 'OPPOSITE_TREND',
-          },
+        type: StrategyActionType.REDUCE, side, reason: 'REDUCE_SOFT',
+        reducePct: trendAligned ? 0.35 : 0.5, expectedPrice: input.market.price,
+        metadata: { mode: 'STRUCTURE_INVALIDATION', unrealizedPnlPct },
       };
     }
 
-    if (trendAligned && positionAgeMs < DEFAULT_TREND_CARRY_PROTECT_MS) {
-      // After 3 minutes, allow early soft-reduce if structure is breaking (hard exit still locked)
-      if (this.isTrendCarryEarlyStructureBreaking(input, side)) {
-        this.lastSoftReduceTs = input.nowMs;
-        this.lastSoftReduceSide = side;
-        return {
-          type: StrategyActionType.REDUCE,
-          side,
-          reason: 'REDUCE_SOFT',
-          reducePct: 0.4,
-          expectedPrice: input.market.price,
-          metadata: { mode: 'TREND_CARRY_EARLY_STRUCTURE_BREAK', positionAgeMs },
-        };
-      }
-      return null;
-    }
-
-    // Alpha Decay Exit: DFS sinyal gücü giriş anından bu yana önemli ölçüde düştüyse çık
-    // Mikro yapı avantajı (alpha) giriş sonrası üstel olarak çürür.
-    // Giriş DFS'i >= 0.85 iken şimdiki <= (giriş - decay_threshold) düştüyse → soft reduce
-    const entryDfsP = input.position.entryDfsP ?? null;
-    const alphaDfsDecayThreshold = Number(
-      (this.config as Record<string, unknown>).alphaDfsBias15mDecayThreshold ?? 0.35
-    );
-    const alphaDfsDecayMinAgeMs = Number(
-      (this.config as Record<string, unknown>).alphaDfsDecayMinAgeSec ?? 600
-    ) * 1000;
-    if (
-      entryDfsP !== null
-      && positionAgeMs >= alphaDfsDecayMinAgeMs
-      && entryDfsP >= 0.82
-      && unrealizedPnlPct > 0
-    ) {
-      const currentStrength = side === 'LONG' ? dfsP : (1 - dfsP);
-      const entryStrength = side === 'LONG' ? entryDfsP : (1 - entryDfsP);
-      const decay = entryStrength - currentStrength;
-      if (decay >= alphaDfsDecayThreshold) {
-        this.lastSoftReduceTs = input.nowMs;
-        this.lastSoftReduceSide = side;
-        return {
-          type: StrategyActionType.REDUCE,
-          side,
-          reason: 'REDUCE_SOFT',
-          reducePct: 0.35,
-          expectedPrice: input.market.price,
-          metadata: {
-            mode: 'ALPHA_DECAY',
-            entryDfsP,
-            currentDfsP: dfsP,
-            decay: Math.round(decay * 1000) / 1000,
-            positionAgeMs,
-          },
-        };
-      }
-    }
-
-    const sideStrength = side === 'LONG' ? dfsP : (1 - dfsP);
-    const lastSideStrength = side === 'LONG' ? this.lastDfsPercentile : (1 - this.lastDfsPercentile);
-    const weakening = lastSideStrength >= 0.82
-      && sideStrength <= 0.62
-      && (lastSideStrength - sideStrength) >= 0.18;
-    const adverseFlow = this.hasTrendCarryPressure(input, side);
-    const structureBreak = this.hasTrendStructureBreak(input, side, dfsP, thresholds);
-    const agedWinnerGiveback = positionAgeMs >= (15 * 60 * 1000) && carryReduceTriggered && adverseFlow && structureBreak;
-    const timeStop = positionAgeMs >= (18 * 3 * 60 * 1000)
-      && (!trendAligned || adverseFlow || (side === 'LONG' ? dfsP < 0.45 : dfsP > 0.55));
-    const trailingReduce = confirmedTrendExit
-      && weakening
-      && adverseFlow
-      && structureBreak
-      && (!trendAligned || carryReduceTriggered || peakPnlPct <= 0.0035 || unrealizedPnlPct <= 0.0025);
-    const timeStopTriggered = timeStop
-      && (confirmedTrendExit || htfOpposes)
-      && (!stillHoldingTrendWinner || carryReduceTriggered || unrealizedPnlPct <= 0.002);
-
-    if (trailingReduce || timeStopTriggered || agedWinnerGiveback) {
-      this.lastSoftReduceTs = input.nowMs;
-      this.lastSoftReduceSide = side;
-      return {
-        type: StrategyActionType.REDUCE,
-        side,
-        reason: 'REDUCE_SOFT',
-        reducePct: timeStopTriggered ? 0.5 : (trendAligned ? 0.25 : 0.4),
-        expectedPrice: input.market.price,
-        metadata: {
-          unrealizedPnlPct,
-          peakPnlPct,
-          givebackPct,
-          carryReduceTriggered,
-          timeStop: timeStopTriggered,
-          agedWinnerGiveback,
-          adverseFlow,
-          structureBreak,
-          trendAligned,
-        },
-      };
-    }
     return null;
   }
 
@@ -1070,54 +942,18 @@ export class NewStrategyV11 {
     if (!input.position) return null;
     const side = input.position.side;
     const price = input.market.price;
-    const vwap = input.market.vwap;
-    const bias15m = this.bias15m(input);
-    const veto1h = this.veto1h(input);
-    const positionAgeMs = this.getPositionAgeMs(input) ?? 0;
-    const trendAligned = this.isTrendAligned(side, bias15m, veto1h);
-    const htfOpposes = this.isHtfOpposing(side, bias15m, veto1h);
-    const vwapHoldTicks = this.config.hardRevTicks;
-    const configuredMaxLossPct = this.getDynamicStopLossPct(input);
-    const hasDefensiveAddCapacity = Boolean(this.config.defensiveAddEnabled)
-      && input.position.addsUsed < this.config.addSizing.length;
-    const stopLossThreshold = hasDefensiveAddCapacity
-      ? configuredMaxLossPct * 1.5
-      : configuredMaxLossPct;
     const unrealizedPnlPct = input.position.unrealizedPnlPct ?? 0;
-    const peakPnlPct = this.getPeakPnlPct(input);
-    const givebackPct = this.getProfitGivebackPct(input);
-    const carryHardExitArmed = peakPnlPct >= this.getTrendCarryHardExitMinPeakPnlPct();
-    const carryHardExitTriggered = carryHardExitArmed && givebackPct >= this.getVolAdjustedGivebackPct(this.getTrendCarryHardExitGivebackPct(), input);
-    const confirmedTrendExit = this.hasConfirmedTrendExitContext(input, side);
-    const structureInvalidation = this.isStructureInvalidated(input, side);
-    const context = this.getDecisionContext(input);
-    const confirmedOppositePressure = this.adverseTrendBuckets >= this.getTrendExitConfirmBars();
 
-    // --- Scale-out state (per position, resets on new entry) ---
-    const scaleState = this.getOrResetScaleOutState(
-      input.symbol,
-      input.position.entryPrice,
-    );
-
-    // Katman 2: Breakeven stop — arm when position peaks >= +0.5%, exit if it falls back to 0%
-    if (!scaleState.breakevenArmed && peakPnlPct >= 0.005) {
-      scaleState.breakevenArmed = true;
-    }
-    if (scaleState.breakevenArmed && unrealizedPnlPct <= 0) {
-      return {
-        type: StrategyActionType.EXIT,
-        side,
-        reason: 'EXIT_BREAKEVEN_STOP',
-        expectedPrice: price,
-        metadata: { unrealizedPnlPct, peakPnlPct, breakevenArmed: true },
-      };
-    }
-
-    // Katman 1: Kademeli stop (scale-out) — partial reduces before full stop
-    // partialStop1 = 50% of full stop (e.g. -0.6% when full stop is -1.2%)
-    // partialStop2 = 75% of full stop (e.g. -0.9% when full stop is -1.2%)
-    const partialStop1Pct = stopLossThreshold * 0.5;
-    const partialStop2Pct = stopLossThreshold * 0.75;
+    // ═══════════════════════════════════════════════════════════════
+    // HARD STOP: Yapısal %1.5 stop — tek katman, kademeli stop yok
+    // Swing noktası / VAH-VAL arkasına yerleştirilir.
+    // Eğer structure varsa, structure anchor kullanılır.
+    // ═══════════════════════════════════════════════════════════════
+    const HARD_STOP_PCT = -0.015; // %1.5 yapısal stop
+    const structuralStopPct = this.getStructuralStopPct(input, side);
+    const stopLossThreshold = structuralStopPct !== null
+      ? Math.min(structuralStopPct, HARD_STOP_PCT) // whichever is tighter
+      : HARD_STOP_PCT;
 
     if (unrealizedPnlPct <= stopLossThreshold) {
       return {
@@ -1127,153 +963,65 @@ export class NewStrategyV11 {
         expectedPrice: price,
         metadata: {
           unrealizedPnlPct,
-          maxLossPct: configuredMaxLossPct,
           stopLossThreshold,
-          defensiveAddArmed: hasDefensiveAddCapacity,
+          structuralStop: structuralStopPct,
+          mode: 'STRUCTURAL_HARD_STOP',
         },
       };
     }
-    if (unrealizedPnlPct <= partialStop2Pct && !scaleState.stop2Used) {
-      scaleState.stop2Used = true;
-      return {
-        type: StrategyActionType.REDUCE,
-        side,
-        reason: 'REDUCE_PARTIAL_STOP_2',
-        reducePct: 0.35,
-        expectedPrice: price,
-        metadata: { unrealizedPnlPct, partialStop2Pct, stopLossThreshold },
-      };
-    }
-    if (unrealizedPnlPct <= partialStop1Pct && !scaleState.stop1Used) {
-      scaleState.stop1Used = true;
-      return {
-        type: StrategyActionType.REDUCE,
-        side,
-        reason: 'REDUCE_PARTIAL_STOP_1',
-        reducePct: 0.40,
-        expectedPrice: price,
-        metadata: { unrealizedPnlPct, partialStop1Pct, stopLossThreshold },
-      };
-    }
-    const lockState = this.isTrendCarryHoldLocked(input, side);
-    if (lockState === 'SOFT_REDUCE_ONLY') {
-      return {
-        type: StrategyActionType.REDUCE,
-        side,
-        reason: 'REDUCE_TREND_CARRY_EARLY_STRUCTURE_BREAK',
-        reducePct: 0.4,
-        expectedPrice: price,
-        metadata: { unrealizedPnlPct, peakPnlPct },
-      };
-    }
-    if (lockState === 'LOCKED' && !confirmedTrendExit) {
-      return null;
-    }
 
-    // Katman 3: Time-based flat exit — 30 min with no meaningful profit AND no trend alignment
-    // Exit to free capital from stalled positions. Only fires when not trend-aligned.
-    const FLAT_EXIT_MS = 30 * 60 * 1000;
-    const FLAT_THRESHOLD_PCT = 0.002; // within ±0.2% of entry = "flat"
-    if (
-      positionAgeMs >= FLAT_EXIT_MS
-      && Math.abs(unrealizedPnlPct) <= FLAT_THRESHOLD_PCT
-      && !trendAligned
-      && !carryHardExitArmed
-    ) {
+    // ═══════════════════════════════════════════════════════════════
+    // FLOW REVERSAL EXIT: Mikro yapı (order flow) tersine döndüğünde çık
+    // Bu, partial stop'lar ve breakeven stop'un yerini alır.
+    // Kârdayken akış tersine dönerse → pozisyonu kapat
+    // ═══════════════════════════════════════════════════════════════
+    const flowReversalExit = this.checkFlowReversalExit(input, dfsP, side);
+    if (flowReversalExit) {
       return {
         type: StrategyActionType.EXIT,
         side,
-        reason: 'EXIT_HARD',
+        reason: 'EXIT_FLOW_REVERSAL',
         expectedPrice: price,
-        metadata: { mode: 'TIME_FLAT_EXIT', positionAgeMs, unrealizedPnlPct },
+        metadata: {
+          unrealizedPnlPct,
+          peakPnlPct: this.getPeakPnlPct(input),
+          dfsP,
+          cvdSlope: input.market.cvdSlope,
+          obiWeighted: input.market.obiWeighted,
+          mode: 'FLOW_REVERSAL',
+        },
       };
     }
 
-    if (this.shouldProtectFreshExit(input, dfsP, thresholds)) {
-      return null;
+    // ═══════════════════════════════════════════════════════════════
+    // SEVERE OPPOSITE PRESSURE: Extreme karşı akış → acil çıkış
+    // ═══════════════════════════════════════════════════════════════
+    if (this.hasSevereOppositePressure(input, dfsP, thresholds)) {
+      const confirmedTrendExit = this.hasConfirmedTrendExitContext(input, side);
+      const bias15m = this.bias15m(input);
+      const veto1h = this.veto1h(input);
+      const trendAligned = this.isTrendAligned(side, bias15m, veto1h);
+      if (confirmedTrendExit || !trendAligned || unrealizedPnlPct <= 0) {
+        return { type: StrategyActionType.EXIT, side, reason: 'EXIT_HARD', expectedPrice: price,
+          metadata: { mode: 'SEVERE_PRESSURE', unrealizedPnlPct } };
+      }
     }
+
+    // ═══════════════════════════════════════════════════════════════
+    // CONTEXT BLOCKED: Execution blocked by manipulation/liquidity
+    // ═══════════════════════════════════════════════════════════════
+    const context = this.getDecisionContext(input);
     if (
       context
       && context.execution.quality === 'BLOCKED'
-      && (context.manipulation.risk === 'HIGH' || this.hasSevereOppositePressure(input, dfsP, thresholds) || unrealizedPnlPct <= 0)
+      && (context.manipulation.risk === 'HIGH' || unrealizedPnlPct <= 0)
     ) {
       return {
-        type: StrategyActionType.EXIT,
-        side,
-        reason: 'EXIT_HARD',
-        expectedPrice: price,
-        metadata: {
-          contextBlocked: true,
-          blockedReasons: context.execution.blockedReasons,
-        },
-      };
-    }
-    if (structureInvalidation && (!trendAligned || htfOpposes || confirmedTrendExit || unrealizedPnlPct <= 0 || carryHardExitTriggered)) {
-      return {
-        type: StrategyActionType.EXIT,
-        side,
-        reason: 'EXIT_HARD',
-        expectedPrice: price,
-        metadata: {
-          structureInvalidation: true,
-          trendAligned,
-          htfOpposes,
-          confirmedTrendExit,
-        },
+        type: StrategyActionType.EXIT, side, reason: 'EXIT_HARD', expectedPrice: price,
+        metadata: { mode: 'CONTEXT_BLOCKED', blockedReasons: context.execution.blockedReasons },
       };
     }
 
-    if (
-      positionAgeMs >= (15 * 60 * 1000)
-      && carryHardExitTriggered
-      && (!trendAligned || htfOpposes)
-      && this.hasDirectCarryShock(input, side, dfsP, thresholds)
-    ) {
-      return { type: StrategyActionType.EXIT, side, reason: 'EXIT_HARD', expectedPrice: price };
-    }
-
-    if (this.hasSevereOppositePressure(input, dfsP, thresholds)) {
-      const ageMs = this.getPositionAgeMs(input);
-      const missingAgeEmergency = ageMs === null;
-      if ((confirmedTrendExit || missingAgeEmergency) && (!trendAligned || unrealizedPnlPct <= 0 || carryHardExitTriggered)) {
-        return { type: StrategyActionType.EXIT, side, reason: 'EXIT_HARD', expectedPrice: price };
-      }
-      return null;
-    }
-
-    const strongStructureFailure = side === 'LONG'
-      ? price < vwap
-        && (this.vwapBelowTicks >= Math.max(6, vwapHoldTicks) || confirmedOppositePressure)
-        && dfsP <= Math.min(0.22, thresholds.longBreak - 0.15)
-        && input.market.deltaZ <= -1.2
-        && input.market.delta5s < 0
-        && input.market.cvdSlope < 0
-        && input.market.obiWeighted < -0.05
-      : price > vwap
-        && (this.vwapAboveTicks >= Math.max(6, vwapHoldTicks) || confirmedOppositePressure)
-        && dfsP >= Math.max(0.78, thresholds.shortBreak + 0.15)
-        && input.market.deltaZ >= 1.2
-        && input.market.delta5s > 0
-        && input.market.cvdSlope > 0
-        && input.market.obiWeighted > 0.05;
-
-    if (!trendAligned && strongStructureFailure && confirmedTrendExit) {
-      return { type: StrategyActionType.EXIT, side, reason: 'EXIT_HARD', expectedPrice: price };
-    }
-
-    if (
-      confirmedTrendExit
-      &&
-      trendAligned
-      && strongStructureFailure
-      && (
-        unrealizedPnlPct <= 0.001
-        || carryHardExitTriggered
-        || (positionAgeMs >= (18 * 3 * 60 * 1000) && unrealizedPnlPct <= 0.002)
-      )
-    ) {
-      return { type: StrategyActionType.EXIT, side, reason: 'EXIT_HARD', expectedPrice: price };
-    }
     return null;
   }
 
@@ -1609,6 +1357,268 @@ export class NewStrategyV11 {
       ? Number(this.config.targetVolPct)
       : 0.003;
     return clamp(target / atrPct, 0.5, 1.5);
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  // DFS Rolling Window — Peak/Trough tracking for new setups
+  // ═══════════════════════════════════════════════════════════════
+
+  private updateDfsRollingWindow(nowMs: number, dfsP: number): void {
+    this.dfsRollingWindow.push({ ts: nowMs, dfsP });
+    // Trim old entries beyond lookback window
+    const cutoff = nowMs - this.DFS_ROLLING_WINDOW_MS;
+    while (this.dfsRollingWindow.length > 0 && this.dfsRollingWindow[0].ts < cutoff) {
+      this.dfsRollingWindow.shift();
+    }
+
+    // Arm exhaustion fade: DFS peak >= 0.90
+    if (dfsP >= 0.90) {
+      this.exhaustionFadeArmed = true;
+      this.exhaustionFadeArmTs = nowMs;
+    }
+    // Arm trend pullback: DFS trough <= 0.10
+    if (dfsP <= 0.10) {
+      this.trendPullbackArmed = true;
+      this.trendPullbackArmTs = nowMs;
+    }
+
+    // Expire armed states after 60s
+    if (this.exhaustionFadeArmed && (nowMs - this.exhaustionFadeArmTs > this.SETUP_ARM_EXPIRY_MS)) {
+      this.exhaustionFadeArmed = false;
+    }
+    if (this.trendPullbackArmed && (nowMs - this.trendPullbackArmTs > this.SETUP_ARM_EXPIRY_MS)) {
+      this.trendPullbackArmed = false;
+    }
+  }
+
+  private getDfsPeakInWindow(): number {
+    if (this.dfsRollingWindow.length === 0) return 0.5;
+    let peak = 0;
+    for (const s of this.dfsRollingWindow) {
+      if (s.dfsP > peak) peak = s.dfsP;
+    }
+    return peak;
+  }
+
+  private getDfsTroughInWindow(): number {
+    if (this.dfsRollingWindow.length === 0) return 0.5;
+    let trough = 1;
+    for (const s of this.dfsRollingWindow) {
+      if (s.dfsP < trough) trough = s.dfsP;
+    }
+    return trough;
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  // SETUP 1: Exhaustion Fade — Momentum tükenmesi ve ters dönüş
+  // MR rejiminde: fiyat VAH kırılır, DFS 0.90'a ulaşır, sonra düşer
+  // ═══════════════════════════════════════════════════════════════
+
+  /**
+   * SHORT Exhaustion Fade:
+   * - DFS peak >= 0.90 in window (armed)
+   * - Trigger: DFS dropped < 0.70 (momentum broken)
+   * - CVD Slope < 0 (sellers stepping in via limits)
+   * - OBI Deep < -0.20 (institutional sell walls in deep book)
+   * - Price > VAH (outside value area to the upside)
+   */
+  private checkExhaustionFadeShort(
+    input: StrategyInput,
+    dfsP: number,
+    context: StrategyDecisionContext | null,
+  ): boolean {
+    if (!this.exhaustionFadeArmed) return false;
+    // Trigger: DFS must have dropped from peak
+    if (dfsP >= 0.70) return false;
+
+    // Absorption confirmation
+    if (input.market.cvdSlope >= 0) return false;
+    if (input.market.obiDeep >= -0.20) return false;
+
+    // Price must be above VAH (outside value area)
+    if (context?.auction.aboveVah === true) return true;
+
+    // Fallback: price > VWAP (elevated)
+    const price = input.market.price;
+    const vwap = input.market.vwap;
+    return vwap > 0 && price > vwap * 1.002;
+  }
+
+  /**
+   * LONG Exhaustion Fade (mirror):
+   * - DFS trough <= 0.10 in window (armed via trendPullbackArmed reused)
+   * - Trigger: DFS risen > 0.30 (selling exhausted)
+   * - CVD Slope > 0 (buyers stepping in)
+   * - OBI Deep > 0.20 (institutional buy walls)
+   * - Price < VAL (outside value area to the downside)
+   */
+  private checkExhaustionFadeLong(
+    input: StrategyInput,
+    dfsP: number,
+    context: StrategyDecisionContext | null,
+  ): boolean {
+    if (!this.trendPullbackArmed) return false;
+    if (dfsP <= 0.30) return false;
+
+    if (input.market.cvdSlope <= 0) return false;
+    if (input.market.obiDeep <= 0.20) return false;
+
+    if (context?.auction.belowVal === true) return true;
+    const price = input.market.price;
+    const vwap = input.market.vwap;
+    return vwap > 0 && price < vwap * 0.998;
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  // SETUP 2: Trend Pullback & Reload — Trend içi yeniden yükleme
+  // TR rejiminde: trend yukarıdır, fiyat VWAP/VAL'a çekilir,
+  // panik satışı durur, alıcılar kontrolü ele alır
+  // ═══════════════════════════════════════════════════════════════
+
+  /**
+   * LONG Trend Pullback:
+   * - Trend UP (1h bias UP)
+   * - Price near VWAP or near VAL
+   * - DFS dipped <= 0.10 (panic selling)
+   * - Trigger: DeltaZ > 0 AND DFS > 0.30 (selling stopped, buyers returning)
+   * - OBI Weighted > 0.15 (orderbook buy pressure)
+   */
+  private checkTrendPullbackLong(
+    input: StrategyInput,
+    dfsP: number,
+    context: StrategyDecisionContext | null,
+  ): boolean {
+    if (!this.trendPullbackArmed) return false;
+
+    // Trigger: DFS recovered above 0.30 and deltaZ positive (buyers back)
+    if (dfsP <= 0.30) return false;
+    if (input.market.deltaZ <= 0) return false;
+
+    // Filter: orderbook buy pressure
+    if (input.market.obiWeighted <= 0.15) return false;
+
+    // Price must be near VWAP or VAL
+    const price = input.market.price;
+    const vwap = input.market.vwap;
+    const nearVwap = vwap > 0 && Math.abs(price - vwap) / vwap < 0.005;
+    const nearVal = context?.auction.belowVal === true || (context?.auction.inValue === true);
+    return nearVwap || nearVal;
+  }
+
+  /**
+   * SHORT Trend Pullback (mirror):
+   * - Trend DOWN
+   * - Price near VWAP or near VAH
+   * - DFS spiked >= 0.90 (FOMO buying)
+   * - Trigger: DeltaZ < 0 AND DFS < 0.70 (buying stopped, sellers returning)
+   * - OBI Weighted < -0.15 (orderbook sell pressure)
+   */
+  private checkTrendPullbackShort(
+    input: StrategyInput,
+    dfsP: number,
+    context: StrategyDecisionContext | null,
+  ): boolean {
+    if (!this.exhaustionFadeArmed) return false;
+
+    if (dfsP >= 0.70) return false;
+    if (input.market.deltaZ >= 0) return false;
+    if (input.market.obiWeighted >= -0.15) return false;
+
+    const price = input.market.price;
+    const vwap = input.market.vwap;
+    const nearVwap = vwap > 0 && Math.abs(price - vwap) / vwap < 0.005;
+    const nearVah = context?.auction.aboveVah === true || (context?.auction.inValue === true);
+    return nearVwap || nearVah;
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  // FLOW REVERSAL EXIT — Order flow tersine döndüğünde çık
+  // Partial stop ve breakeven stop yerine: akış bazlı çıkış
+  // ═══════════════════════════════════════════════════════════════
+
+  /**
+   * Flow Reversal: akış tersine döndü mü?
+   * LONG pozisyonda: CVD Slope negatif, DFS düşüyor, OBI satış ağırlıklı
+   * SHORT pozisyonda: CVD Slope pozitif, DFS yükseliyor, OBI alım ağırlıklı
+   *
+   * Sadece kârdayken veya çok uzun süredir tutulmuş pozisyonlarda tetiklenir.
+   */
+  private checkFlowReversalExit(
+    input: StrategyInput,
+    dfsP: number,
+    side: StrategySide,
+  ): boolean {
+    if (!input.position) return false;
+    const unrealizedPnlPct = input.position.unrealizedPnlPct ?? 0;
+    const peakPnlPct = this.getPeakPnlPct(input);
+    const positionAgeMs = this.getPositionAgeMs(input) ?? 0;
+
+    // Only fire if we're in profit (protecting gains) OR position is very old (>20 min)
+    const inProfit = unrealizedPnlPct > 0.002; // at least 0.2% profit
+    const isAged = positionAgeMs >= 20 * 60_000;
+    if (!inProfit && !isAged) return false;
+
+    // Require meaningful peak first (at least 0.3% was achieved)
+    if (peakPnlPct < 0.003) return false;
+
+    // Check flow reversal conditions
+    if (side === 'LONG') {
+      // For LONG: sellers taking over
+      return (
+        input.market.cvdSlope < -0.3
+        && dfsP < 0.35
+        && input.market.obiWeighted < -0.10
+        && input.market.deltaZ < -0.5
+      );
+    }
+
+    // For SHORT: buyers taking over
+    return (
+      input.market.cvdSlope > 0.3
+      && dfsP > 0.65
+      && input.market.obiWeighted > 0.10
+      && input.market.deltaZ > 0.5
+    );
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  // STRUCTURAL STOP — VAH/VAL/Swing noktası arkasında %1.5 stop
+  // ═══════════════════════════════════════════════════════════════
+
+  private getStructuralStopPct(input: StrategyInput, side: StrategySide): number | null {
+    const entryPrice = input.position?.entryPrice ?? 0;
+    if (entryPrice <= 0) return null;
+    const price = input.market.price;
+
+    // Try structure anchor first (swing points)
+    const structure = this.getStructure(input);
+    if (structure) {
+      if (side === 'LONG' && structure.anchors.longStopAnchor != null) {
+        const stopDist = (entryPrice - structure.anchors.longStopAnchor) / entryPrice;
+        return -(stopDist + 0.002); // add 0.2% buffer beyond swing low
+      }
+      if (side === 'SHORT' && structure.anchors.shortStopAnchor != null) {
+        const stopDist = (structure.anchors.shortStopAnchor - entryPrice) / entryPrice;
+        return -(stopDist + 0.002);
+      }
+    }
+
+    // Try VAH/VAL from auction context
+    const context = this.getDecisionContext(input);
+    if (context?.auction.profile) {
+      const vah = context.auction.profile.vah;
+      const val = context.auction.profile.val;
+      if (side === 'LONG' && val != null && val > 0) {
+        const stopDist = (entryPrice - val) / entryPrice;
+        if (stopDist > 0) return -(stopDist + 0.002);
+      }
+      if (side === 'SHORT' && vah != null && vah > 0) {
+        const stopDist = (vah - entryPrice) / entryPrice;
+        if (stopDist > 0) return -(stopDist + 0.002);
+      }
+    }
+
+    return null; // no structural reference → fall through to default 1.5%
   }
 
   // CVD 4-Quadrant framework — detects absorpsiyon (pasif emilim) vs tükenme (exhaustion)
