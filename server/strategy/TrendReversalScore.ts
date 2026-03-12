@@ -60,10 +60,10 @@ export interface TrendReversalConfig {
 }
 
 const DEFAULT_TRS_CONFIG: TrendReversalConfig = {
-  emaFastAlpha: 0.15,
-  emaSlowAlpha: 0.05,
-  confirmTicks: 3,
-  reversalThreshold: 0.35,
+  emaFastAlpha: 0.06,       // Slower fast EMA — less noise sensitivity
+  emaSlowAlpha: 0.015,      // Very slow EMA — represents the "old trend"
+  confirmTicks: 30,          // 30 seconds of sustained direction before confirming reversal
+  reversalThreshold: 0.45,   // Higher threshold — need stronger signal to trigger
 };
 
 export class TrendReversalScore {

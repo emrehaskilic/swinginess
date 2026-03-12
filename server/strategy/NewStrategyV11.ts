@@ -125,10 +125,10 @@ export class NewStrategyV11 {
     this.regimeSelector = new RegimeSelector(this.norm, this.config.regimeLockTRMRTicks, this.config.regimeLockEVTicks);
     this.regimeScorer = new ProbabilisticRegimeScorer();
     this.trs = new TrendReversalScore({
-      emaFastAlpha: this.config.trsEmaFastAlpha ?? 0.15,
-      emaSlowAlpha: this.config.trsEmaSlowAlpha ?? 0.05,
-      confirmTicks: this.config.trsConfirmTicks ?? 3,
-      reversalThreshold: this.config.trsReversalThreshold ?? 0.35,
+      emaFastAlpha: this.config.trsEmaFastAlpha ?? 0.06,
+      emaSlowAlpha: this.config.trsEmaSlowAlpha ?? 0.015,
+      confirmTicks: this.config.trsConfirmTicks ?? 30,
+      reversalThreshold: this.config.trsReversalThreshold ?? 0.45,
     });
     this.WARMUP_MIN_SAMPLES = this.config.warmupMinSamples ?? 100;
     this.decisionLog = decisionLog;
@@ -277,18 +277,21 @@ export class NewStrategyV11 {
       return this.buildDecision(input, activeRegime, dfsOut, thresholds, gate, actions, reasons);
     }
 
-    if (!input.position) {
-      this.lastSoftReduceTs = 0;
-      this.lastSoftReduceSide = null;
-      this.isEvScalpPosition = false;
-      this.swingPositionDirection = null;
+    // ═══════════════════════════════════════════════════════════════
+    // V13 SWING MODE: When enabled, ALL entry/exit goes through TRS.
+    // Old scalp logic is COMPLETELY bypassed.
+    // Only hard stop-loss (1.5%) remains as safety net.
+    // ═══════════════════════════════════════════════════════════════
+    if (swingEnabled) {
+      if (!input.position) {
+        this.lastSoftReduceTs = 0;
+        this.lastSoftReduceSide = null;
+        this.isEvScalpPosition = false;
+        this.swingPositionDirection = null;
 
-      // V13 Swing Mode: Use TRS reversal for entry in TR regime
-      const isSwingEntry = swingEnabled && activeRegime === 'TR' && trsOut.reversal && trsOut.direction;
-      if (isSwingEntry && trsOut.direction) {
-        const swingSide = trsOut.direction;
-        // Verify not in cooldown or MHT
-        if (!this.isInCooldown(swingSide, nowMs, regimeOut.volLevel) && !this.isInMHT(swingSide, nowMs, regimeOut.volLevel)) {
+        // Swing entry: only when TRS detects a confirmed reversal
+        if (trsOut.reversal && trsOut.direction) {
+          const swingSide = trsOut.direction;
           this.lastEntryTs = nowMs;
           this.lastEntrySide = swingSide;
           this.lastEntryRegime = activeRegime;
@@ -298,7 +301,7 @@ export class NewStrategyV11 {
             side: swingSide,
             reason: 'ENTRY_SWING_REVERSAL',
             expectedPrice: input.market.price,
-            sizeMultiplier: this.getEntrySizeMultiplier(input, 'TREND_CONTINUATION'),
+            sizeMultiplier: 1.0,
             metadata: {
               setupKind: 'SWING_REVERSAL',
               trsConfidence: trsOut.confidence,
@@ -312,7 +315,59 @@ export class NewStrategyV11 {
           actions.push({ type: StrategyActionType.NOOP, reason: 'NO_SIGNAL' });
         }
       } else {
-        // Original entry logic (MR, EV, or non-swing TR)
+        // Swing position management
+        this.swingPositionDirection = this.swingPositionDirection || input.position.side;
+
+        // Check TRS reversal → exit + enter opposite
+        if (trsOut.reversal && trsOut.direction && trsOut.direction !== input.position.side) {
+          const exitSide = input.position.side;
+          const newSide = trsOut.direction;
+          actions.push({
+            type: StrategyActionType.EXIT, side: exitSide, reason: 'EXIT_SWING_REVERSAL',
+            expectedPrice: input.market.price,
+            metadata: {
+              mode: 'SWING_REVERSAL',
+              trsConfidence: trsOut.confidence,
+              trsComponents: trsOut.components,
+              unrealizedPnlPct: input.position.unrealizedPnlPct ?? 0,
+            },
+          });
+          actions.push({
+            type: StrategyActionType.ENTRY, side: newSide, reason: 'ENTRY_SWING_REVERSAL',
+            expectedPrice: input.market.price,
+            sizeMultiplier: 1.0,
+            metadata: { setupKind: 'SWING_REVERSAL', trsConfidence: trsOut.confidence },
+          });
+          reasons.push('EXIT_SWING_REVERSAL', 'ENTRY_SWING_REVERSAL');
+          this.lastExitTs = nowMs;
+          this.lastExitSide = exitSide;
+          this.lastEntryTs = nowMs;
+          this.lastEntrySide = newSide;
+          this.lastEntryRegime = activeRegime;
+          this.swingPositionDirection = newSide;
+        } else {
+          // HOLD — only hard stop-loss can exit a swing position
+          const hardStopAction = this.maybeSwingHardStop(input);
+          if (hardStopAction) {
+            actions.push(hardStopAction);
+            reasons.push(hardStopAction.reason);
+            this.lastExitTs = nowMs;
+            this.lastExitSide = input.position.side;
+            this.swingPositionDirection = null;
+          } else {
+            actions.push({ type: StrategyActionType.NOOP, reason: 'NOOP' });
+            reasons.push('NOOP');
+          }
+        }
+      }
+    } else {
+      // ═══════════════════════════════════════════════════════════════
+      // LEGACY SCALP MODE (swingModeEnabled = false)
+      // ═══════════════════════════════════════════════════════════════
+      if (!input.position) {
+        this.lastSoftReduceTs = 0;
+        this.lastSoftReduceSide = null;
+        this.isEvScalpPosition = false;
         const entryAction = this.evaluateEntry(input, dfsOut.dfsPercentile, dfsOut.dfs, activeRegime, regimeOut.volLevel, thresholds, reasons);
         if (entryAction) {
           actions.push(entryAction);
@@ -323,57 +378,7 @@ export class NewStrategyV11 {
           reasons.push('NO_SIGNAL');
           actions.push({ type: StrategyActionType.NOOP, reason: 'NO_SIGNAL' });
         }
-      }
-    } else {
-      const isSwingHold = swingEnabled && this.swingPositionDirection !== null;
-
-      // V13 Swing Mode: TRS reversal triggers exit + new entry
-      if (isSwingHold && trsOut.reversal && trsOut.direction && trsOut.direction !== input.position.side) {
-        // Trend reversed — exit current position and enter opposite
-        const exitSide = input.position.side;
-        const newSide = trsOut.direction;
-        actions.push({
-          type: StrategyActionType.EXIT, side: exitSide, reason: 'EXIT_SWING_REVERSAL',
-          expectedPrice: input.market.price,
-          metadata: {
-            mode: 'SWING_REVERSAL',
-            trsConfidence: trsOut.confidence,
-            trsComponents: trsOut.components,
-            unrealizedPnlPct: input.position.unrealizedPnlPct ?? 0,
-          },
-        });
-        actions.push({
-          type: StrategyActionType.ENTRY, side: newSide, reason: 'ENTRY_SWING_REVERSAL',
-          expectedPrice: input.market.price,
-          sizeMultiplier: this.getEntrySizeMultiplier(input, 'TREND_CONTINUATION'),
-          metadata: {
-            setupKind: 'SWING_REVERSAL',
-            trsConfidence: trsOut.confidence,
-          },
-        });
-        reasons.push('EXIT_SWING_REVERSAL', 'ENTRY_SWING_REVERSAL');
-        this.lastExitTs = nowMs;
-        this.lastExitSide = exitSide;
-        this.lastEntryTs = nowMs;
-        this.lastEntrySide = newSide;
-        this.lastEntryRegime = activeRegime;
-        this.swingPositionDirection = newSide;
-      } else if (isSwingHold) {
-        // Swing hold mode: only hard stop-loss active, everything else disabled
-        const hardStopAction = this.maybeSwingHardStop(input);
-        if (hardStopAction) {
-          actions.push(hardStopAction);
-          reasons.push(hardStopAction.reason);
-          this.lastExitTs = nowMs;
-          this.lastExitSide = input.position.side;
-          this.swingPositionDirection = null;
-        } else {
-          // HOLD — no time-stop, no exit-score, no soft reduce
-          actions.push({ type: StrategyActionType.NOOP, reason: 'NOOP' });
-          reasons.push('NOOP');
-        }
       } else {
-        // Original position management (non-swing: MR, EV, or swing disabled)
         const hardRev = this.checkHardReversal(input, dfsOut.dfsPercentile);
         if (hardRev.valid) {
           const hardRevSize = this.config.hardRevSizeMultiplier ?? 0.75;
@@ -406,13 +411,11 @@ export class NewStrategyV11 {
               actions.push(reduceAction);
               reasons.push(reduceAction.reason);
             }
-
             const addAction = this.maybeAdd(input, dfsOut.dfsPercentile, regimeOut.volLevel);
             if (addAction) {
               actions.push(addAction);
               reasons.push(addAction.reason);
             }
-
             if (actions.length === 0) {
               actions.push({ type: StrategyActionType.NOOP, reason: 'NOOP' });
               reasons.push('NOOP');
