@@ -777,6 +777,9 @@ export class DryRunSessionService {
         lastExitOrderTs: 0,
         lastReduceOrderTs: 0,
         workingOrderLogState: new Map<string, string>(),
+        compositeReward: new CompositeRewardFunction(),
+        gaOptimizer: new GAParamOptimizer(),
+        mtfConfluence: new MultiTimeframeConfluence(),
       });
     }
 
