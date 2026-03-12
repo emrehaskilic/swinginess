@@ -1,3 +1,5 @@
+import { BINANCE_REST_BASE } from '../config/binanceEndpoints';
+
 export interface FundingRateInfo {
   symbol: string;
   fundingRate: number;
@@ -15,7 +17,7 @@ export class FundingRateMonitor {
 
   async updateFundingRate(symbol: string): Promise<void> {
     const normalized = symbol.toUpperCase();
-    const response = await this.fetchImpl(`https://fapi.binance.com/fapi/v1/fundingRate?symbol=${normalized}&limit=1`);
+    const response = await this.fetchImpl(`${BINANCE_REST_BASE}/fapi/v1/fundingRate?symbol=${normalized}&limit=1`);
     if (!response.ok) {
       return;
     }

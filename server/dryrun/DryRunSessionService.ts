@@ -13,6 +13,7 @@ import { DryRunClock } from './DryRunClock';
 import { ActiveTrade, PositionLifecycleManager } from './PositionLifecycleManager';
 import { MaterializedSymbolCapitalConfig, SymbolCapitalConfig, materializeSymbolCapitalConfigs, normalizeSymbolCapitalConfigs } from '../types/capital';
 import type { StructureBias, StructureSnapshot, SwingLabel } from '../structure/types';
+import { BINANCE_REST_BASE, BINANCE_WS_BASE } from '../config/binanceEndpoints';
 import { PositionSizer } from '../position/PositionSizer';
 import { CompositeRewardFunction } from '../metrics/CompositeRewardFunction';
 import { GAParamOptimizer, GAParamGene } from '../strategy/GAParamOptimizer';
@@ -702,8 +703,8 @@ export class DryRunSessionService {
         fundingIntervalMs,
         proxy: {
           mode: 'backend-proxy',
-          restBaseUrl: 'https://fapi.binance.com',
-          marketWsBaseUrl: 'wss://fstream.binance.com/stream',
+          restBaseUrl: BINANCE_REST_BASE,
+          marketWsBaseUrl: BINANCE_WS_BASE,
         },
       };
 
@@ -897,8 +898,8 @@ export class DryRunSessionService {
         fundingIntervalMs: config.fundingIntervalMs,
         proxy: {
           mode: 'backend-proxy',
-          restBaseUrl: 'https://fapi.binance.com',
-          marketWsBaseUrl: 'wss://fstream.binance.com/stream',
+          restBaseUrl: BINANCE_REST_BASE,
+          marketWsBaseUrl: BINANCE_WS_BASE,
         },
       };
       const engine = new DryRunEngine(cfg);

@@ -69,6 +69,12 @@ export type DecisionReason =
   | 'ENTRY_EV_SCALP'
   | 'ENTRY_SWING_REVERSAL'
   | 'EXIT_SWING_REVERSAL'
+  | 'SWING_HTF_BLOCKED'
+  | 'SWING_HTF_NEUTRAL_BAD_LOCATION'
+  | 'EXIT_SWING_TRAILING'
+  | 'EXIT_SWING_SCORE_HARD'
+  | 'REDUCE_SWING_SCORE_SOFT'
+  | 'EXIT_SWING_TIME_FLAT'
   | 'WARMUP_GUARD'
   | 'NO_SIGNAL'
   | 'NOOP';
@@ -434,14 +440,51 @@ export interface StrategyConfig {
   // V13 — Swing Trading Mode
   swingModeEnabled?: boolean;
   warmupMinSamples?: number;
-  trsReversalThreshold?: number;
   trsConfirmTicks?: number;
-  trsEmaFastAlpha?: number;
-  trsEmaSlowAlpha?: number;
+  trsDfsBullishZone?: number;
+  trsDfsBearishZone?: number;
+  trsAgreementThreshold?: number;
   swingHoldDisableTimeStop?: boolean;
   swingHoldDisableExitScore?: boolean;
   swingHoldDisableSoftReduce?: boolean;
   swingMinHoldMs?: number;
+
+  // V13.1 — Swing Profitability Upgrades
+  // Faz 2: ATR-adaptif swing stop
+  swingAtrStopMultiplier?: number;
+  swingAtrStopMin?: number;
+  swingAtrStopMax?: number;
+  // Faz 3: Trailing stop + DFS duyarlılık
+  swingTrailingActivationPct?: number;
+  swingTrailingDistancePct?: number;
+  swingTrailingAtrMultiplier?: number;
+  swingTrailingDfsTightenThreshold?: number;
+  swingTrailingDfsTightenFactor?: number;
+  // Faz 4: Swing exit score
+  swingExitScoreEnabled?: boolean;
+  swingExitScoreHardThreshold?: number;
+  swingExitScoreSoftThreshold?: number;
+  swingExitScoreMinHoldMs?: number;
+  // Faz 5: Vol-normalize sizing
+  swingTargetVolPct?: number;
+  // Faz 6: TRS hacim filtresi
+  trsMinPrintsPerSec?: number;
+  // Faz 7: HTF esnetme + VWAP konum
+  swingHtfNeutralSizeMultiplier?: number;
+  // Faz 8: Zaman koruması
+  swingTimeTightenMs?: number;
+  swingTimeFlatExitMs?: number;
+  swingTimeTightenTrailFactor?: number;
+
+  // V13.2: Anti-whipsaw — minimum hold + cooldown
+  swingMinHoldForReversalMs?: number;  // default 180_000 (3 min)
+  swingReversalCooldownMs?: number;    // default 300_000 (5 min, was 10 min)
+
+  // V13.3: Quality filters — block entries in adverse conditions
+  swingMaxChopScore?: number;          // default 0.60 — block entry if market too choppy
+  swingMaxVpinForEntry?: number;       // default 0.60 — reduce size if informed trading high
+  swingVpinHardBlockThreshold?: number; // default 0.80 — V13.4: hard block entry if VPIN extremely toxic
+  swingMaxRegimeEntropy?: number;      // default 0.80 — block entry if regime uncertain
 }
 
 export const defaultStrategyConfig: StrategyConfig = {

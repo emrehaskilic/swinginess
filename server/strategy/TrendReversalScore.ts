@@ -1,18 +1,23 @@
 /**
- * TrendReversalScore (TRS) — V13 Swing Trading Module
+ * TrendReversalScore (TRS) — V13.2 Direct Metrics Approach
  *
- * Detects trend reversals by tracking sustained direction changes across
- * multiple microstructure indicators. Designed for 5-minute candle swing
- * trading where trends last 1-4 hours.
+ * Detects trend reversals by reading the bot's own orderflow metrics
+ * DIRECTLY — no EMA smoothing, no crossovers, no double-processing.
  *
- * Core signals:
- *   1. CVD Slope direction flip (EMA-smoothed)
- *   2. DeltaZ sustained sign change
- *   3. OBI Weighted sign flip
- *   4. DFS Percentile crossing midpoint (0.5)
+ * The bot already computes institutional-grade signals:
+ *   - DFS Percentile: 8-component dual-normalized composite (0-1)
+ *   - CVD Slope: cumulative volume delta rate of change
+ *   - DeltaZ: delta z-score (normalized buying/selling pressure)
+ *   - OBI Weighted: orderbook imbalance
  *
- * A reversal requires persistence: indicators must stay flipped for
- * N consecutive ticks (configurable, default 3) to confirm.
+ * These ARE the trend. A reversal = sustained flip of these metrics
+ * to the opposite zone for N consecutive ticks.
+ *
+ * Logic:
+ *   1. DFS Percentile in bullish zone (>= 0.60) or bearish zone (<= 0.40)
+ *   2. Cross-check: CVD slope sign + DeltaZ sign agree with DFS direction
+ *   3. N consecutive ticks in the same zone = confirmed direction
+ *   4. Direction change from confirmed LONG to confirmed SHORT (or vice versa) = reversal
  */
 
 const clamp = (v: number, min: number, max: number) => Math.max(min, Math.min(max, v));
@@ -49,35 +54,25 @@ export interface TrendReversalOutput {
 }
 
 export interface TrendReversalConfig {
-  /** EMA alpha for fast smoothing (default 0.15) */
-  emaFastAlpha: number;
-  /** EMA alpha for slow smoothing (default 0.05) */
-  emaSlowAlpha: number;
-  /** Min ticks for reversal confirmation (default 3) */
+  /** DFS percentile threshold for bullish zone (default 0.60) */
+  dfsBullishZone: number;
+  /** DFS percentile threshold for bearish zone (default 0.40) */
+  dfsBearishZone: number;
+  /** Min ticks for reversal confirmation (default 60) */
   confirmTicks: number;
-  /** Threshold for composite score to trigger reversal (default 0.35) */
-  reversalThreshold: number;
+  /** Min agreement score to consider direction valid (default 0.35) */
+  agreementThreshold: number;
 }
 
 const DEFAULT_TRS_CONFIG: TrendReversalConfig = {
-  emaFastAlpha: 0.06,       // Slower fast EMA — less noise sensitivity
-  emaSlowAlpha: 0.015,      // Very slow EMA — represents the "old trend"
-  confirmTicks: 30,          // 30 seconds of sustained direction before confirming reversal
-  reversalThreshold: 0.45,   // Higher threshold — need stronger signal to trigger
+  dfsBullishZone: 0.60,
+  dfsBearishZone: 0.40,
+  confirmTicks: 60,
+  agreementThreshold: 0.35,
 };
 
 export class TrendReversalScore {
   private readonly config: TrendReversalConfig;
-
-  // EMA-smoothed indicators
-  private cvdFastEma = 0;
-  private cvdSlowEma = 0;
-  private deltaZFastEma = 0;
-  private deltaZSlowEma = 0;
-  private obiFastEma = 0;
-  private obiSlowEma = 0;
-  private dfsFastEma = 0.5;
-  private dfsSlowEma = 0.5;
 
   // Current trend tracking
   private currentDirection: 'LONG' | 'SHORT' | 'NEUTRAL' = 'NEUTRAL';
@@ -86,7 +81,7 @@ export class TrendReversalScore {
 
   // Warmup tracking
   private tickCount = 0;
-  private readonly WARMUP_TICKS = 20; // Need at least 20 ticks before EMAs are meaningful
+  private readonly WARMUP_TICKS = 60;
 
   constructor(config?: Partial<TrendReversalConfig>) {
     this.config = { ...DEFAULT_TRS_CONFIG, ...(config || {}) };
@@ -99,32 +94,8 @@ export class TrendReversalScore {
 
   compute(input: TrendReversalInput): TrendReversalOutput {
     this.tickCount++;
-    const alpha = this.config.emaFastAlpha;
-    const slowAlpha = this.config.emaSlowAlpha;
 
-    // Update EMAs
-    if (this.tickCount === 1) {
-      // Initialize EMAs with first values
-      this.cvdFastEma = input.cvdSlope;
-      this.cvdSlowEma = input.cvdSlope;
-      this.deltaZFastEma = input.deltaZ;
-      this.deltaZSlowEma = input.deltaZ;
-      this.obiFastEma = input.obiWeighted;
-      this.obiSlowEma = input.obiWeighted;
-      this.dfsFastEma = input.dfsPercentile;
-      this.dfsSlowEma = input.dfsPercentile;
-    } else {
-      this.cvdFastEma = alpha * input.cvdSlope + (1 - alpha) * this.cvdFastEma;
-      this.cvdSlowEma = slowAlpha * input.cvdSlope + (1 - slowAlpha) * this.cvdSlowEma;
-      this.deltaZFastEma = alpha * input.deltaZ + (1 - alpha) * this.deltaZFastEma;
-      this.deltaZSlowEma = slowAlpha * input.deltaZ + (1 - slowAlpha) * this.deltaZSlowEma;
-      this.obiFastEma = alpha * input.obiWeighted + (1 - alpha) * this.obiFastEma;
-      this.obiSlowEma = slowAlpha * input.obiWeighted + (1 - slowAlpha) * this.obiSlowEma;
-      this.dfsFastEma = alpha * input.dfsPercentile + (1 - alpha) * this.dfsFastEma;
-      this.dfsSlowEma = slowAlpha * input.dfsPercentile + (1 - slowAlpha) * this.dfsSlowEma;
-    }
-
-    // During warmup, return neutral
+    // During warmup, return neutral — let metrics stabilize
     if (this.tickCount < this.WARMUP_TICKS) {
       return {
         reversal: false,
@@ -136,40 +107,46 @@ export class TrendReversalScore {
       };
     }
 
-    // ─── Component Signals ───
-    // Each component outputs a value from -1 (strongly bearish) to +1 (strongly bullish)
+    // ─── Read Metrics Directly ───
+    // No EMA, no smoothing — the bot's pipeline already did that work
 
-    // 1. CVD Slope flip: fast EMA vs slow EMA crossover
-    //    When fast > slow → buying momentum increasing → bullish
-    const cvdDiff = this.cvdFastEma - this.cvdSlowEma;
-    const cvdFlip = clamp(cvdDiff / 0.3, -1, 1);
+    // 1. DFS Percentile: the primary directional signal (already 0-1 normalized)
+    //    Map to [-1, +1]: 0.5 = neutral, 1.0 = max bullish, 0.0 = max bearish
+    const dfsDirection = clamp((input.dfsPercentile - 0.5) / 0.5, -1, 1);
 
-    // 2. DeltaZ direction: sustained delta in one direction
-    const deltaZDiff = this.deltaZFastEma - this.deltaZSlowEma;
-    const deltaZFlip = clamp(deltaZDiff / 1.5, -1, 1);
+    // 2. CVD Slope: buying vs selling momentum
+    //    Positive = net buying pressure, negative = net selling
+    //    Clamp to [-1, 1] using reasonable range
+    const cvdFlip = clamp(input.cvdSlope / 500, -1, 1);
 
-    // 3. OBI Weighted flip: orderbook pressure direction
-    const obiDiff = this.obiFastEma - this.obiSlowEma;
-    const obiFlip = clamp(obiDiff / 0.15, -1, 1);
+    // 3. DeltaZ: normalized delta (z-score of buy-sell imbalance)
+    //    Already z-scored by the pipeline, typical range [-3, +3]
+    const deltaZFlip = clamp(input.deltaZ / 2.5, -1, 1);
 
-    // 4. DFS Percentile direction: above/below 0.5 midpoint
-    //    Use deviation from 0.5 as directional signal
-    const dfsDeviation = this.dfsFastEma - 0.5;
-    const dfsDirection = clamp(dfsDeviation / 0.25, -1, 1);
+    // 4. OBI Weighted: orderbook imbalance
+    //    Typical range [-1, +1], already normalized
+    const obiFlip = clamp(input.obiWeighted / 0.5, -1, 1);
 
-    // ─── Composite Trend Score ───
-    // Weighted combination: CVD and DeltaZ are most important for reversal detection
-    const trendScore = 0.30 * cvdFlip
-                     + 0.30 * deltaZFlip
-                     + 0.20 * obiFlip
-                     + 0.20 * dfsDirection;
+    // ─── Composite Score ───
+    // DFS has highest weight — it's already a multi-signal composite
+    // CVD and DeltaZ confirm actual trade flow direction
+    // OBI adds orderbook-side confirmation
+    const trendScore = 0.40 * dfsDirection
+                     + 0.25 * cvdFlip
+                     + 0.20 * deltaZFlip
+                     + 0.15 * obiFlip;
 
-    // ─── Direction Detection ───
-    const threshold = this.config.reversalThreshold;
+    // ─── Zone Detection ───
+    // Use DFS zones as primary trigger, composite score as confirmation
+    const bullZone = this.config.dfsBullishZone;
+    const bearZone = this.config.dfsBearishZone;
+    const threshold = this.config.agreementThreshold;
+
     let detectedDirection: 'LONG' | 'SHORT' | 'NEUTRAL' = 'NEUTRAL';
-    if (trendScore > threshold) {
+
+    if (input.dfsPercentile >= bullZone && trendScore > threshold) {
       detectedDirection = 'LONG';
-    } else if (trendScore < -threshold) {
+    } else if (input.dfsPercentile <= bearZone && trendScore < -threshold) {
       detectedDirection = 'SHORT';
     }
 
@@ -177,12 +154,12 @@ export class TrendReversalScore {
     if (detectedDirection === this.currentDirection && detectedDirection !== 'NEUTRAL') {
       this.directionConfirmCount++;
     } else if (detectedDirection !== 'NEUTRAL') {
-      // Direction changed — start counting for new direction
+      // New direction — start fresh counter
       this.currentDirection = detectedDirection;
       this.directionConfirmCount = 1;
     } else {
-      // NEUTRAL — don't reset counter, just don't increment
-      // This prevents noise from resetting a valid reversal detection
+      // NEUTRAL tick — don't reset, just don't increment
+      // This allows brief neutral moments without breaking a valid build-up
     }
 
     // ─── Reversal Detection ───
@@ -193,12 +170,12 @@ export class TrendReversalScore {
       this.lastConfirmedDirection = this.currentDirection;
     }
 
-    // Confidence: based on how many components agree with the direction
+    // ─── Confidence ───
+    // Count how many raw metrics agree with the detected direction
     const dirSign = detectedDirection === 'LONG' ? 1 : detectedDirection === 'SHORT' ? -1 : 0;
-    const agreementCount = [cvdFlip, deltaZFlip, obiFlip, dfsDirection]
-      .filter(v => Math.sign(v) === dirSign && Math.abs(v) > 0.2)
-      .length;
-    const confidence = isConfirmed ? clamp(agreementCount / 4, 0, 1) : 0;
+    const components = [dfsDirection, cvdFlip, deltaZFlip, obiFlip];
+    const agreeing = components.filter(v => Math.sign(v) === dirSign && Math.abs(v) > 0.15).length;
+    const confidence = isConfirmed ? clamp(agreeing / 4, 0, 1) : 0;
 
     return {
       reversal: isReversal,

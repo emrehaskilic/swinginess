@@ -1,3 +1,5 @@
+import { BINANCE_REST_BASE } from '../config/binanceEndpoints';
+
 /**
  * OpenInterestMonitor tracks futures open interest metrics
  * 
@@ -50,7 +52,7 @@ export class OpenInterestMonitor {
 
     try {
       const response = await fetch(
-        `https://fapi.binance.com/fapi/v1/openInterest?symbol=${this.symbol}`
+        `${BINANCE_REST_BASE}/fapi/v1/openInterest?symbol=${this.symbol}`
       );
 
       if (!response.ok) {

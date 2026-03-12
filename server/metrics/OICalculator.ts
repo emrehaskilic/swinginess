@@ -1,3 +1,5 @@
+import { BINANCE_REST_BASE } from '../config/binanceEndpoints';
+
 export interface OIPanelMetrics {
     currentOI: number;
     oiChangeAbs: number;
@@ -19,7 +21,7 @@ export class OICalculator {
 
     private lastPollTs = 0;
 
-    constructor(symbol: string, restBaseUrl: string = 'https://fapi.binance.com') {
+    constructor(symbol: string, restBaseUrl: string = BINANCE_REST_BASE) {
         this.symbol = symbol;
         this.restBaseUrl = restBaseUrl;
     }

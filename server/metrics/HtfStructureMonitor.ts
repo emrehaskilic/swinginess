@@ -1,3 +1,5 @@
+import { BINANCE_REST_BASE } from '../config/binanceEndpoints';
+
 type Timeframe = '15m' | '1h' | '4h';
 
 interface KlinePoint {
@@ -148,7 +150,7 @@ export class HtfStructureMonitor {
 
   constructor(
     private readonly symbol: string,
-    private readonly restBaseUrl: string = 'https://fapi.binance.com',
+    private readonly restBaseUrl: string = BINANCE_REST_BASE,
   ) {
     this.config = {
       intervalMs: Math.max(5_000, Number(process.env.HTF_REFRESH_MS || 60_000)),

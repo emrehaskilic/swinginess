@@ -7,6 +7,8 @@
  * tests can call `update()` directly with synthetic data.
  */
 
+import { BINANCE_REST_BASE } from '../config/binanceEndpoints';
+
 export interface FundingMetrics {
   symbol: string;
   rate: number;
@@ -72,7 +74,7 @@ export class FundingMonitor {
   private async fetchAndUpdate(): Promise<void> {
     try {
       // Use premiumIndex which includes nextFundingTime
-      const url = `https://fapi.binance.com/fapi/v1/premiumIndex?symbol=${this.symbol}`;
+      const url = `${BINANCE_REST_BASE}/fapi/v1/premiumIndex?symbol=${this.symbol}`;
       const res = await fetch(url);
       if (!res.ok) return;
       const data: any = await res.json();

@@ -115,8 +115,7 @@ const productionRuntimeConfig = bootValidation(process.env);
 
 const PORT = parseInt(process.env.PORT || '8787', 10);
 const HOST = process.env.HOST || '0.0.0.0'; // Listen on all interfaces for Nginx proxy
-const BINANCE_REST_BASE = 'https://fapi.binance.com';
-const BINANCE_WS_BASE = 'wss://fstream.binance.com/stream';
+import { BINANCE_REST_BASE, BINANCE_WS_BASE } from './config/binanceEndpoints';
 const DEFAULT_MAKER_FEE_RATE = Number(process.env.MAKER_FEE_BPS || '2') / 10000;
 const DEFAULT_TAKER_FEE_RATE = Number(process.env.TAKER_FEE_BPS || '4') / 10000;
 
@@ -554,7 +553,7 @@ const strategyApiConsensusEngine = {
             short: { count: 0, avgConfidence: 0 },
             flat: { count: 1, avgConfidence: 0 },
         },
-        strategyIds: ['new-strategy-v11'],
+        strategyIds: ['swing-v13.4'],
         shouldTrade: false,
     }),
     getConfig: () => ({
@@ -859,7 +858,7 @@ const EXCHANGE_INFO_TTL_MS = 1000 * 60 * 60; // 1 hr
 let globalBackoffUntil = 0; // Starts at 0 to allow fresh attempts on restart
 let symbolConcurrencyLimit = Math.max(AUTO_SCALE_MIN_SYMBOLS, Number(process.env.SYMBOL_CONCURRENCY || 20));
 let autoScaleLastUpTs = 0;
-const STRATEGY_ENGINE_NAME = 'NewStrategyV11';
+const STRATEGY_ENGINE_NAME = 'Swing V13.2';
 
 function syncRiskEngineRuntime(
     symbol: string,
@@ -2865,7 +2864,7 @@ function buildStrategyTelemetryFromDecision(
     const reasons = Array.isArray(decision?.reasons) ? [...decision.reasons] : [];
     const primaryAction = Array.isArray(decision?.actions) ? decision.actions[0] : null;
     const signal: StrategySignal = {
-        strategyId: 'new-strategy-v11',
+        strategyId: 'swing-v13.4',
         strategyName: STRATEGY_ENGINE_NAME,
         side: signalSide,
         confidence,
@@ -4139,8 +4138,8 @@ app.post('/api/dry-run/run', (req, res) => {
                 : undefined,
             proxy: {
                 mode: 'backend-proxy',
-                restBaseUrl: String(body.restBaseUrl || 'https://fapi.binance.com'),
-                marketWsBaseUrl: String(body.marketWsBaseUrl || 'wss://fstream.binance.com/stream'),
+                restBaseUrl: String(body.restBaseUrl || BINANCE_REST_BASE),
+                marketWsBaseUrl: String(body.marketWsBaseUrl || BINANCE_WS_BASE),
             },
         };
 
