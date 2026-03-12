@@ -348,7 +348,7 @@ export class SwingRunService {
             const res = await fetch(url);
             if (!res.ok) throw new Error(`http_${res.status}`);
 
-            const raw: unknown[][] = await res.json();
+            const raw = (await res.json()) as unknown[][];
             if (!Array.isArray(raw)) throw new Error('invalid_response');
 
             rt.bootstrap.barsLoaded = raw.length;
