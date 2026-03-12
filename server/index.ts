@@ -2561,6 +2561,8 @@ async function processSymbolEvent(s: string, d: any) {
 
         const shouldEvaluateStrategy = decisionFlowEnabled
             && (!decision || (now - meta.lastStrategyEvalTs) >= STRATEGY_EVAL_MIN_INTERVAL_MS);
+        // Hoist so we can reuse in broadcast without a second getMetrics() call
+        let advancedBundleForDecision: AdvancedMicrostructureBundle | null = null;
         if (shouldEvaluateStrategy) {
             const calcStart = Date.now();
             legMetrics = leg.computeMetrics(ob, Number(t || now));
@@ -2576,7 +2578,7 @@ async function processSymbolEvent(s: string, d: any) {
             spreadPct = spreadRatio == null ? null : (spreadRatio * 100);
             const decisionSessionVwap = leg.getSessionVwapSnapshot(Number(t || now), mid);
             const profileSnapshot = sessionProfile.snapshot(Number(t || now), mid);
-            const advancedBundleForDecision = advancedMicro.getMetrics(Number(t || now));
+            advancedBundleForDecision = advancedMicro.getMetrics(Number(t || now));
             const expectedSlippagePctForDecision = Math.max(
                 Number(advancedBundleForDecision.liquidityMetrics.expectedSlippageBuy || 0),
                 Number(advancedBundleForDecision.liquidityMetrics.expectedSlippageSell || 0)
@@ -2766,7 +2768,8 @@ async function processSymbolEvent(s: string, d: any) {
                 }
                 : null,
         });
-        const advancedBundle = advancedMicro.getMetrics(Number(t || now));
+        // Reuse cached bundle from strategy eval (or get fresh — cache ensures no double compute)
+        const advancedBundle = advancedBundleForDecision ?? advancedMicro.getMetrics(Number(t || now));
 
         // [DRY RUN INTEGRATION]
         const isDryRunTracked = dryRunSession.isTrackingSymbol(s);

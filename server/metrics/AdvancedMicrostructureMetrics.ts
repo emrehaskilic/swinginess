@@ -180,6 +180,11 @@ export class AdvancedMicrostructureMetrics {
   private lastTradePrice: number | null = null;
   private latestReturn: number | null = null;
 
+  // ── getMetrics() cache: avoid recomputing within the same tick ──
+  private _cachedBundle: AdvancedMicrostructureBundle | null = null;
+  private _cachedBundleTs = 0;
+  private static readonly METRICS_CACHE_TTL_MS = 150;
+
   private readonly ret1mStats = new WindowStats(60_000, 40_000);
   private readonly ret5mStats = new WindowStats(300_000, 80_000);
   private readonly ret15mStats = new WindowStats(900_000, 120_000);
@@ -285,6 +290,10 @@ export class AdvancedMicrostructureMetrics {
 
   public getLatestReturn(): number | null { return this.latestReturn; }
 
+  // Throttle heavy depth computations (liquidity, passive flow) to max once per 250ms
+  private _lastHeavyDepthTs = 0;
+  private static readonly DEPTH_HEAVY_THROTTLE_MS = 250;
+
   public onDepthSnapshot(input: DepthSnapshotInput): void {
     const ts = Number.isFinite(input.timestampMs) ? Number(input.timestampMs) : Date.now();
     const bids = this.normalizeLevels(input.bids, true);
@@ -301,12 +310,19 @@ export class AdvancedMicrostructureMetrics {
       this.resolvePendingBurstChecks(ts, mid);
     }
 
+    // Always update lightweight metrics
     this.currentTopDepthNotional10 = this.computeTopDepthNotional(bids, asks, 10);
     this.currentPerpImbalance10 = this.computeImbalanceRatio(bids, asks, 10);
 
-    this.updateLiquidityMetrics(ts, bids, asks, bestBid, bestAsk, mid);
-    this.updatePassiveFlowMetrics(ts, bids, asks);
-    this.updateResiliency(ts, bids, asks);
+    // Throttle heavy metrics (5x imbalance, 2x slippage, passive flow map diff)
+    const wallTs = Date.now();
+    if ((wallTs - this._lastHeavyDepthTs) >= AdvancedMicrostructureMetrics.DEPTH_HEAVY_THROTTLE_MS) {
+      this._lastHeavyDepthTs = wallTs;
+      this.updateLiquidityMetrics(ts, bids, asks, bestBid, bestAsk, mid);
+      this.updatePassiveFlowMetrics(ts, bids, asks);
+      this.updateResiliency(ts, bids, asks);
+      this.invalidateMetricsCache();
+    }
   }
 
   public onTrade(input: TradeSnapshotInput): void {
@@ -392,8 +408,18 @@ export class AdvancedMicrostructureMetrics {
     }
   }
 
+  /** Invalidate the getMetrics cache (call after state-mutating events like onTrade/onDepth) */
+  public invalidateMetricsCache(): void {
+    this._cachedBundle = null;
+  }
+
   public getMetrics(nowMs?: number): AdvancedMicrostructureBundle {
     const now = Number.isFinite(nowMs as number) ? Number(nowMs) : Date.now();
+
+    // Return cached result if still fresh (avoids duplicate heavy computation within same event cycle)
+    if (this._cachedBundle && (now - this._cachedBundleTs) < AdvancedMicrostructureMetrics.METRICS_CACHE_TTL_MS) {
+      return this._cachedBundle;
+    }
 
     this.applySpoofDecay(now);
     this.applyLiquidationDecay(now);
@@ -477,7 +503,7 @@ export class AdvancedMicrostructureMetrics {
       realizedSpreadShortWindow: this.realizedSpreadStats.mean(now),
     };
 
-    return {
+    const bundle: AdvancedMicrostructureBundle = {
       liquidityMetrics,
       passiveFlowMetrics,
       derivativesMetrics,
@@ -486,6 +512,9 @@ export class AdvancedMicrostructureMetrics {
       crossMarketMetrics,
       enableCrossMarketConfirmation: this.crossEnabled,
     };
+    this._cachedBundle = bundle;
+    this._cachedBundleTs = now;
+    return bundle;
   }
 
   private normalizeLevels(levels: [number, number, number][], bids: boolean): [number, number, number][] {
@@ -736,10 +765,18 @@ export class AdvancedMicrostructureMetrics {
   }
 
   private prunePriceRefreshMap(now: number): void {
-    if (this.addTimestampByPrice.size <= 400) return;
+    if (this.addTimestampByPrice.size <= 150) return;
     const cutoff = now - Math.max(this.refreshWindowMs, this.spoofWindowMs, 60_000);
     for (const [key, ts] of this.addTimestampByPrice.entries()) {
       if (ts < cutoff) this.addTimestampByPrice.delete(key);
+    }
+    // Hard cap: if still too large after time-based prune, drop oldest half
+    if (this.addTimestampByPrice.size > 500) {
+      let toDelete = this.addTimestampByPrice.size - 250;
+      for (const key of this.addTimestampByPrice.keys()) {
+        if (toDelete-- <= 0) break;
+        this.addTimestampByPrice.delete(key);
+      }
     }
   }
 
