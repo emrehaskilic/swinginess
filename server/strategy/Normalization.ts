@@ -255,3 +255,51 @@ export class NormalizationStore {
     return this.stats.get(key)!;
   }
 }
+
+/**
+ * V12 — DualNormalizationStore
+ * Two-layer normalization: micro (5min) for entry signals, macro (60min) for trend detection.
+ * Both layers receive the same updates; consumers pick the appropriate layer.
+ */
+export class DualNormalizationStore {
+  readonly micro: NormalizationStore;
+  readonly macro: NormalizationStore;
+
+  constructor(microWindowMs = 5 * 60_000, macroWindowMs = 60 * 60_000, bins = 64) {
+    this.micro = new NormalizationStore(microWindowMs, bins);
+    this.macro = new NormalizationStore(macroWindowMs, bins);
+  }
+
+  update(key: string, value: number, ts: number): void {
+    this.micro.update(key, value, ts);
+    this.macro.update(key, value, ts);
+  }
+
+  /** Micro z-score — responsive, for entry signals */
+  microZScore(key: string, value: number): number {
+    return this.micro.zScore(key, value);
+  }
+
+  /** Macro z-score — stable, for trend detection */
+  macroZScore(key: string, value: number): number {
+    return this.macro.zScore(key, value);
+  }
+
+  /** Micro percentile — responsive */
+  microPercentile(key: string, value: number): number {
+    return this.micro.percentile(key, value);
+  }
+
+  /** Macro percentile — stable */
+  macroPercentile(key: string, value: number): number {
+    return this.macro.percentile(key, value);
+  }
+
+  microCount(key: string): number {
+    return this.micro.count(key);
+  }
+
+  macroCount(key: string): number {
+    return this.macro.count(key);
+  }
+}

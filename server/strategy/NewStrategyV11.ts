@@ -14,10 +14,11 @@ import {
   defaultStrategyConfig,
 } from '../types/strategy';
 import type { StructureSnapshot } from '../structure/types';
-import { NormalizationStore } from './Normalization';
+import { NormalizationStore, DualNormalizationStore } from './Normalization';
 import { DirectionalFlowScore } from './DirectionalFlowScore';
 import { RegimeSelector } from './RegimeSelector';
 import { ProbabilisticRegimeScorer, RegimePosterior } from './ProbabilisticRegimeScorer';
+import { TrendReversalScore, TrendReversalOutput } from './TrendReversalScore';
 import { deriveBias15m, deriveVeto1h } from './HtfBias';
 
 const clamp = (v: number, min: number, max: number) => Math.max(min, Math.min(max, v));
@@ -41,6 +42,7 @@ const INCLUDE_REPLAY_INPUT = String(process.env.DECISION_LOG_INCLUDE_REPLAY_INPU
 export class NewStrategyV11 {
   private readonly config: StrategyConfig;
   private readonly norm: NormalizationStore;
+  private readonly dualNorm: DualNormalizationStore;
   private readonly dfs: DirectionalFlowScore;
   private readonly regimeSelector: RegimeSelector;
   private readonly regimeScorer: ProbabilisticRegimeScorer;
@@ -60,6 +62,7 @@ export class NewStrategyV11 {
   private lastHardExitSide: StrategySide | null = null;
   private lastHardReversalTs = 0;
   private lastHardReversalSide: StrategySide | null = null;
+  private lastActiveRegime: StrategyRegime = 'MR';
   private lastDfsPercentile = 0.5;
   private lastDeltaZ = 0;
   private prevPrice: number | null = null;
@@ -92,13 +95,42 @@ export class NewStrategyV11 {
   private trendPullbackArmTs = 0;
   private readonly SETUP_ARM_EXPIRY_MS = 60_000; // armed state expires after 60s
 
+  // ─── V12: MHT Bailout — track consecutive adverse DFS ticks ───
+  private bailoutAdverseTicks = 0;
+  private bailoutPositionSide: StrategySide | null = null;
+
+  // ─── V13: Swing Mode — TrendReversalScore ───
+  private readonly trs: TrendReversalScore;
+  private lastTrsOutput: TrendReversalOutput | null = null;
+  private swingPositionDirection: 'LONG' | 'SHORT' | null = null;
+  private readonly WARMUP_MIN_SAMPLES: number;
+
+  // ─── V12: EV Scalp daily counter ───
+  private evScalpTodayCount = 0;
+  private evScalpLastResetDay = -1;
+
+  // ─── V12: Last Exit Score (for telemetry/logging) ───
+  private lastExitScore = 0;
+
+  // ─── V12: EV Scalp position tracking ───
+  private isEvScalpPosition = false;
+
   constructor(config?: Partial<StrategyConfig>, decisionLog?: DecisionLog) {
     this.config = { ...defaultStrategyConfig, ...(config || {}) };
     const windowMs = Math.max(60_000, this.config.rollingWindowMin * 60_000);
     this.norm = new NormalizationStore(windowMs, 64);
-    this.dfs = new DirectionalFlowScore(this.norm);
+    // V12: Dual normalization — 5min micro (entry signals) + 60min macro (trend detection)
+    this.dualNorm = new DualNormalizationStore(5 * 60_000, 60 * 60_000, 64);
+    this.dfs = new DirectionalFlowScore(this.norm, undefined, this.dualNorm);
     this.regimeSelector = new RegimeSelector(this.norm, this.config.regimeLockTRMRTicks, this.config.regimeLockEVTicks);
     this.regimeScorer = new ProbabilisticRegimeScorer();
+    this.trs = new TrendReversalScore({
+      emaFastAlpha: this.config.trsEmaFastAlpha ?? 0.15,
+      emaSlowAlpha: this.config.trsEmaSlowAlpha ?? 0.05,
+      confirmTicks: this.config.trsConfirmTicks ?? 3,
+      reversalThreshold: this.config.trsReversalThreshold ?? 0.35,
+    });
+    this.WARMUP_MIN_SAMPLES = this.config.warmupMinSamples ?? 100;
     this.decisionLog = decisionLog;
   }
 
@@ -153,6 +185,11 @@ export class NewStrategyV11 {
       prevPrice: this.prevPrice,
       prevCvd: this.prevCvdSlope,
       nowMs,
+      // V12: OI Dynamic Weight — pass regime + OI freshness for w8 boost in MR
+      regime: this.lastActiveRegime as 'TR' | 'MR' | 'EV',
+      oiLastUpdatedMs: input.openInterest?.lastUpdatedMs,
+      oiDynamicWeightMR: this.config.oiDynamicWeightMR,
+      oiStalenessMaxMs: this.config.oiStalenessMaxMs,
     });
 
     this.norm.update('delta1sAbs', Math.abs(input.market.delta1s), nowMs);
@@ -184,12 +221,41 @@ export class NewStrategyV11 {
     const thresholds = this.computeThresholds(regimeOut.volLevel, activeRegime);
     const actions: StrategyAction[] = [];
 
+    // V13: Compute TrendReversalScore every tick
+    const trsOut = this.trs.compute({
+      cvdSlope: input.market.cvdSlope,
+      deltaZ: input.market.deltaZ,
+      obiWeighted: input.market.obiWeighted,
+      dfsPercentile: dfsOut.dfsPercentile,
+      price: input.market.price,
+      vwap: input.market.vwap,
+      nowMs,
+    });
+    this.lastTrsOutput = trsOut;
+
     this.updateVwapTicks(input.market.price, input.market.vwap);
     this.updateTrendDecisionState(input);
     this.updateDfsRollingWindow(nowMs, dfsOut.dfsPercentile);
+    this.updateBailoutState(input, dfsOut.dfsPercentile);
 
     if (gate.passed) {
       this.lastDecisionTs = nowMs;
+    }
+
+    // V13: Warmup Guard — don't trade until normalization has enough data (ALL regimes)
+    const swingEnabled = this.config.swingModeEnabled ?? true;
+    if (gate.passed && !input.position) {
+      const sampleCount = this.norm.count('dfs');
+      if (sampleCount < this.WARMUP_MIN_SAMPLES) {
+        reasons.push('WARMUP_GUARD');
+        actions.push({ type: StrategyActionType.NOOP, reason: 'WARMUP_GUARD' });
+        this.lastActiveRegime = activeRegime;
+        this.lastDfsPercentile = dfsOut.dfsPercentile;
+        this.lastDeltaZ = input.market.deltaZ;
+        this.prevPrice = input.market.price;
+        this.prevCvdSlope = input.market.cvdSlope;
+        return this.buildDecision(input, activeRegime, dfsOut, thresholds, gate, actions, reasons);
+      }
     }
 
     if (!gate.passed) {
@@ -214,68 +280,153 @@ export class NewStrategyV11 {
     if (!input.position) {
       this.lastSoftReduceTs = 0;
       this.lastSoftReduceSide = null;
-      const entryAction = this.evaluateEntry(input, dfsOut.dfsPercentile, dfsOut.dfs, activeRegime, regimeOut.volLevel, thresholds, reasons);
-      if (entryAction) {
-        actions.push(entryAction);
-        reasons.push(entryAction.reason);
-        this.lastEntrySide = entryAction.side || null;
-        this.lastEntryRegime = activeRegime;
+      this.isEvScalpPosition = false;
+      this.swingPositionDirection = null;
+
+      // V13 Swing Mode: Use TRS reversal for entry in TR regime
+      const isSwingEntry = swingEnabled && activeRegime === 'TR' && trsOut.reversal && trsOut.direction;
+      if (isSwingEntry && trsOut.direction) {
+        const swingSide = trsOut.direction;
+        // Verify not in cooldown or MHT
+        if (!this.isInCooldown(swingSide, nowMs, regimeOut.volLevel) && !this.isInMHT(swingSide, nowMs, regimeOut.volLevel)) {
+          this.lastEntryTs = nowMs;
+          this.lastEntrySide = swingSide;
+          this.lastEntryRegime = activeRegime;
+          this.swingPositionDirection = swingSide;
+          actions.push({
+            type: StrategyActionType.ENTRY,
+            side: swingSide,
+            reason: 'ENTRY_SWING_REVERSAL',
+            expectedPrice: input.market.price,
+            sizeMultiplier: this.getEntrySizeMultiplier(input, 'TREND_CONTINUATION'),
+            metadata: {
+              setupKind: 'SWING_REVERSAL',
+              trsConfidence: trsOut.confidence,
+              trsComponents: trsOut.components,
+              trsConfirmTicks: trsOut.confirmTicks,
+            },
+          });
+          reasons.push('ENTRY_SWING_REVERSAL');
+        } else {
+          reasons.push('NO_SIGNAL');
+          actions.push({ type: StrategyActionType.NOOP, reason: 'NO_SIGNAL' });
+        }
       } else {
-        reasons.push('NO_SIGNAL');
-        actions.push({ type: StrategyActionType.NOOP, reason: 'NO_SIGNAL' });
+        // Original entry logic (MR, EV, or non-swing TR)
+        const entryAction = this.evaluateEntry(input, dfsOut.dfsPercentile, dfsOut.dfs, activeRegime, regimeOut.volLevel, thresholds, reasons);
+        if (entryAction) {
+          actions.push(entryAction);
+          reasons.push(entryAction.reason);
+          this.lastEntrySide = entryAction.side || null;
+          this.lastEntryRegime = activeRegime;
+        } else {
+          reasons.push('NO_SIGNAL');
+          actions.push({ type: StrategyActionType.NOOP, reason: 'NO_SIGNAL' });
+        }
       }
     } else {
-      const hardRev = this.checkHardReversal(input, dfsOut.dfsPercentile);
-      if (hardRev.valid) {
-        const hardRevSize = this.config.hardRevSizeMultiplier ?? 0.75;
-        if (!this.isHardReversalDebounced(input.position.side, nowMs)) {
-          actions.push({ type: StrategyActionType.EXIT, side: input.position.side, reason: 'EXIT_HARD_REVERSAL' });
-          actions.push({ type: StrategyActionType.ENTRY, side: this.flipSide(input.position.side), reason: 'HARD_REVERSAL_ENTRY', sizeMultiplier: hardRevSize });
-          reasons.push('EXIT_HARD_REVERSAL', 'HARD_REVERSAL_ENTRY');
+      const isSwingHold = swingEnabled && this.swingPositionDirection !== null;
+
+      // V13 Swing Mode: TRS reversal triggers exit + new entry
+      if (isSwingHold && trsOut.reversal && trsOut.direction && trsOut.direction !== input.position.side) {
+        // Trend reversed — exit current position and enter opposite
+        const exitSide = input.position.side;
+        const newSide = trsOut.direction;
+        actions.push({
+          type: StrategyActionType.EXIT, side: exitSide, reason: 'EXIT_SWING_REVERSAL',
+          expectedPrice: input.market.price,
+          metadata: {
+            mode: 'SWING_REVERSAL',
+            trsConfidence: trsOut.confidence,
+            trsComponents: trsOut.components,
+            unrealizedPnlPct: input.position.unrealizedPnlPct ?? 0,
+          },
+        });
+        actions.push({
+          type: StrategyActionType.ENTRY, side: newSide, reason: 'ENTRY_SWING_REVERSAL',
+          expectedPrice: input.market.price,
+          sizeMultiplier: this.getEntrySizeMultiplier(input, 'TREND_CONTINUATION'),
+          metadata: {
+            setupKind: 'SWING_REVERSAL',
+            trsConfidence: trsOut.confidence,
+          },
+        });
+        reasons.push('EXIT_SWING_REVERSAL', 'ENTRY_SWING_REVERSAL');
+        this.lastExitTs = nowMs;
+        this.lastExitSide = exitSide;
+        this.lastEntryTs = nowMs;
+        this.lastEntrySide = newSide;
+        this.lastEntryRegime = activeRegime;
+        this.swingPositionDirection = newSide;
+      } else if (isSwingHold) {
+        // Swing hold mode: only hard stop-loss active, everything else disabled
+        const hardStopAction = this.maybeSwingHardStop(input);
+        if (hardStopAction) {
+          actions.push(hardStopAction);
+          reasons.push(hardStopAction.reason);
           this.lastExitTs = nowMs;
           this.lastExitSide = input.position.side;
-          this.lastEntryTs = nowMs;
-          this.lastEntrySide = this.flipSide(input.position.side);
-          this.lastEntryRegime = activeRegime;
-          this.lastHardReversalTs = nowMs;
-          this.lastHardReversalSide = input.position.side;
+          this.swingPositionDirection = null;
+        } else {
+          // HOLD — no time-stop, no exit-score, no soft reduce
+          actions.push({ type: StrategyActionType.NOOP, reason: 'NOOP' });
+          reasons.push('NOOP');
         }
       } else {
-        const hardExit = this.maybeHardExit(input, dfsOut.dfsPercentile, thresholds);
-        if (hardExit) {
-          if (!this.isHardExitDebounced(input.position.side, nowMs)) {
-            actions.push(hardExit);
-            reasons.push(hardExit.reason);
+        // Original position management (non-swing: MR, EV, or swing disabled)
+        const hardRev = this.checkHardReversal(input, dfsOut.dfsPercentile);
+        if (hardRev.valid) {
+          const hardRevSize = this.config.hardRevSizeMultiplier ?? 0.75;
+          if (!this.isHardReversalDebounced(input.position.side, nowMs)) {
+            actions.push({ type: StrategyActionType.EXIT, side: input.position.side, reason: 'EXIT_HARD_REVERSAL' });
+            actions.push({ type: StrategyActionType.ENTRY, side: this.flipSide(input.position.side), reason: 'HARD_REVERSAL_ENTRY', sizeMultiplier: hardRevSize });
+            reasons.push('EXIT_HARD_REVERSAL', 'HARD_REVERSAL_ENTRY');
             this.lastExitTs = nowMs;
             this.lastExitSide = input.position.side;
-            this.lastHardExitTs = nowMs;
-            this.lastHardExitSide = input.position.side;
+            this.lastEntryTs = nowMs;
+            this.lastEntrySide = this.flipSide(input.position.side);
+            this.lastEntryRegime = activeRegime;
+            this.lastHardReversalTs = nowMs;
+            this.lastHardReversalSide = input.position.side;
           }
         } else {
-          const reduceAction = this.maybeSoftReduce(input, dfsOut.dfsPercentile, thresholds);
-          if (reduceAction) {
-            actions.push(reduceAction);
-            reasons.push(reduceAction.reason);
-          }
+          const hardExit = this.maybeHardExit(input, dfsOut.dfsPercentile, thresholds);
+          if (hardExit) {
+            if (!this.isHardExitDebounced(input.position.side, nowMs)) {
+              actions.push(hardExit);
+              reasons.push(hardExit.reason);
+              this.lastExitTs = nowMs;
+              this.lastExitSide = input.position.side;
+              this.lastHardExitTs = nowMs;
+              this.lastHardExitSide = input.position.side;
+            }
+          } else {
+            const reduceAction = this.maybeSoftReduce(input, dfsOut.dfsPercentile, thresholds);
+            if (reduceAction) {
+              actions.push(reduceAction);
+              reasons.push(reduceAction.reason);
+            }
 
-          const addAction = this.maybeAdd(input, dfsOut.dfsPercentile, regimeOut.volLevel);
-          if (addAction) {
-            actions.push(addAction);
-            reasons.push(addAction.reason);
-          }
+            const addAction = this.maybeAdd(input, dfsOut.dfsPercentile, regimeOut.volLevel);
+            if (addAction) {
+              actions.push(addAction);
+              reasons.push(addAction.reason);
+            }
 
-          if (actions.length === 0) {
-            actions.push({ type: StrategyActionType.NOOP, reason: 'NOOP' });
-            reasons.push('NOOP');
+            if (actions.length === 0) {
+              actions.push({ type: StrategyActionType.NOOP, reason: 'NOOP' });
+              reasons.push('NOOP');
+            }
           }
         }
-      }
-      if (actions.length === 0) {
-        actions.push({ type: StrategyActionType.NOOP, reason: 'NOOP' });
-        reasons.push('NOOP');
+        if (actions.length === 0) {
+          actions.push({ type: StrategyActionType.NOOP, reason: 'NOOP' });
+          reasons.push('NOOP');
+        }
       }
     }
 
+    this.lastActiveRegime = activeRegime;
     this.lastDfsPercentile = dfsOut.dfsPercentile;
     this.lastDeltaZ = input.market.deltaZ;
     this.prevPrice = input.market.price;
@@ -380,7 +531,10 @@ export class NewStrategyV11 {
     reasons: DecisionReason[]
   ): StrategyAction | null {
     // P0-3: EV (Extreme Volatility) rejiminde yeni pozisyon açma — sadece mevcut pozisyonu yönet
+    // V12: Exception — EV Scalp: tiny LONG when SELL_EXHAUSTION + price well below VWAP
     if (regime === 'EV') {
+      const evScalp = this.checkEvScalpEntry(input);
+      if (evScalp) return evScalp;
       reasons.push('ENTRY_BLOCKED_EV_REGIME');
       return null;
     }
@@ -426,6 +580,53 @@ export class NewStrategyV11 {
         contextQuality: input.decisionContext?.execution.quality ?? null,
         exhaustionFadeArmed: setupKind === 'EXHAUSTION_FADE' ? this.exhaustionFadeArmed : undefined,
         trendPullbackArmed: setupKind === 'TREND_PULLBACK_RELOAD' ? this.trendPullbackArmed : undefined,
+      },
+    };
+  }
+
+  /**
+   * V12 — EV Scalp: Tiny LONG entry during extreme volatility sell exhaustion.
+   * Conditions: SELL_EXHAUSTION quadrant, price >= 0.5% below VWAP, daily limit not hit.
+   */
+  private checkEvScalpEntry(input: StrategyInput): StrategyAction | null {
+    if (!(this.config.evScalpEnabled ?? false)) return null;
+
+    // Reset daily counter at midnight UTC
+    const dayOfYear = Math.floor(input.nowMs / 86_400_000);
+    if (dayOfYear !== this.evScalpLastResetDay) {
+      this.evScalpTodayCount = 0;
+      this.evScalpLastResetDay = dayOfYear;
+    }
+
+    const maxDaily = this.config.evScalpDailyMaxTrades ?? 3;
+    if (this.evScalpTodayCount >= maxDaily) return null;
+
+    const quadrant = this.detectCVDQuadrant(input);
+    if (quadrant !== 'SELL_EXHAUSTION') return null;
+
+    // Price must be sufficiently below VWAP
+    const vwap = input.market.vwap;
+    const price = input.market.price;
+    if (!(vwap > 0) || !(price > 0)) return null;
+    const vwapDistPct = (vwap - price) / vwap;
+    const minDist = this.config.evScalpMinVwapDistPct ?? 0.005;
+    if (vwapDistPct < minDist) return null;
+
+    this.evScalpTodayCount++;
+    this.lastEntryTs = input.nowMs;
+    this.lastEntrySide = 'LONG';
+    this.isEvScalpPosition = true;
+
+    return {
+      type: StrategyActionType.ENTRY,
+      side: 'LONG',
+      reason: 'ENTRY_EV_SCALP',
+      expectedPrice: price,
+      sizeMultiplier: this.config.evScalpSizeMultiplier ?? 0.15,
+      metadata: {
+        setupKind: 'EV_SCALP',
+        vwapDistPct,
+        evScalpTodayCount: this.evScalpTodayCount,
       },
     };
   }
@@ -854,6 +1055,14 @@ export class NewStrategyV11 {
     if (side === 'SHORT' && input.market.cvdSlope >= 0) return null;
     if (Math.abs(input.market.price - input.market.vwap) > Math.abs(input.market.vwap) * 0.0075) return null;
 
+    // V12: Pullback Scale-In — don't add at peak, wait for micro-pullback near VWAP
+    const peakPnlPct = this.getPeakPnlPct(input);
+    const pullbackFromPeak = peakPnlPct - unrealizedPnlPct;
+    const nearVwapForAdd = input.market.vwap > 0
+      && Math.abs(input.market.price - input.market.vwap) / input.market.vwap < 0.002;
+    // If price is at peak (no pullback) AND not near VWAP → skip add
+    if (pullbackFromPeak < 0.001 && !nearVwapForAdd) return null;
+
     const maxPositionSizePct = this.config.maxPositionSizePct ?? 0.25;
     const currentPositionPct = input.position.sizePct ?? 0;
     const addIndex = input.position.addsUsed;
@@ -934,6 +1143,151 @@ export class NewStrategyV11 {
     return null;
   }
 
+  // ═══════════════════════════════════════════════════════════════
+  // V12 EXIT SCORE — 6-component weighted exit signal (replaces
+  // boolean-AND checkFlowReversalExit + hasSevereOppositePressure)
+  // ═══════════════════════════════════════════════════════════════
+
+  private computeExitScore(input: StrategyInput, dfsP: number, side: StrategySide): number {
+    const sign = side === 'LONG' ? 1 : -1;
+    // 1. DeltaZ reversal (0-1): how strongly delta opposes our position
+    const deltaZraw = clamp(-sign * input.market.deltaZ / 3, 0, 1);
+    // 2. CVD Slope reversal (0-1)
+    const cvdRaw = clamp(-sign * input.market.cvdSlope / 1.5, 0, 1);
+    // 3. OBI Weighted reversal (0-1)
+    const obiWRaw = clamp(-sign * input.market.obiWeighted / 0.5, 0, 1);
+    // 4. OBI Divergence (0-1): orderbook says one thing, price does another
+    const obiDiv = input.market.obiDivergence ?? 0;
+    const obiDivRaw = clamp(-sign * obiDiv / 0.5, 0, 1);
+    // 5. VPIN toxicity (0-1): from decision context
+    const context = this.getDecisionContext(input);
+    const vpinRaw = context ? clamp((context.manipulation.vpinApprox - 0.4) / 0.4, 0, 1) : 0;
+    // 6. Burst opposite (0-1): consecutive burst on wrong side
+    const burstSide = input.trades.consecutiveBurst.side;
+    const burstCount = Number(input.trades.consecutiveBurst.count || 0);
+    const burstOpposite = (side === 'LONG' ? burstSide === 'sell' : burstSide === 'buy');
+    const burstRaw = burstOpposite ? clamp(burstCount / 10, 0, 1) : 0;
+
+    // Weighted sum (council-approved weights)
+    const score = 0.25 * deltaZraw
+                + 0.25 * cvdRaw
+                + 0.15 * obiWRaw
+                + 0.15 * obiDivRaw
+                + 0.10 * vpinRaw
+                + 0.10 * burstRaw;
+
+    this.lastExitScore = score;
+    return score;
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  // V12 TIME-STOP — ATR-based 30-120s adaptive time stop
+  // If position not in profit after adaptive time window → reduce/exit
+  // ═══════════════════════════════════════════════════════════════
+
+  private checkTimeStop(input: StrategyInput): StrategyAction | null {
+    if (!input.position) return null;
+    if (!(this.config.timeStopEnabled ?? true)) return null;
+    const side = input.position.side;
+    const unrealizedPnlPct = input.position.unrealizedPnlPct ?? 0;
+    const ageMs = this.getPositionAgeMs(input);
+    if (ageMs === null) return null;
+
+    // Calculate ATR-adaptive time limit
+    const price = Number(input.market.price || 0);
+    const atr = Number(input.volatility || 0);
+    const baseMs = Number(this.config.timeStopBaseMs) || 60_000;
+    const minMs = Number(this.config.timeStopMinMs) || 30_000;
+    const maxMs = Number(this.config.timeStopMaxMs) || 120_000;
+
+    let timeLimit = baseMs;
+    if (price > 0 && atr > 0) {
+      const atrPct = atr / price;
+      const REF_ATR = 0.005; // reference 0.5% ATR
+      // Low vol → longer wait (up to 120s), High vol → shorter (down to 30s)
+      timeLimit = clamp(baseMs * (REF_ATR / Math.max(atrPct, 0.0001)), minMs, maxMs);
+    }
+
+    // Only trigger if position exceeded time limit and NOT in profit
+    if (ageMs < timeLimit) return null;
+    if (unrealizedPnlPct > 0) return null; // in profit — no time stop
+
+    return {
+      type: StrategyActionType.EXIT,
+      side,
+      reason: 'EXIT_TIME_STOP',
+      expectedPrice: input.market.price,
+      metadata: {
+        unrealizedPnlPct,
+        ageMs,
+        timeLimitMs: timeLimit,
+        mode: 'TIME_STOP',
+      },
+    };
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  // V12 MHT BAILOUT — Override fresh position protection if
+  // DFS is severely adverse for 5+ consecutive ticks within 30s
+  // ═══════════════════════════════════════════════════════════════
+
+  private updateBailoutState(input: StrategyInput, dfsP: number): void {
+    if (!input.position) {
+      this.bailoutAdverseTicks = 0;
+      this.bailoutPositionSide = null;
+      return;
+    }
+    const side = input.position.side;
+    if (this.bailoutPositionSide !== side) {
+      this.bailoutAdverseTicks = 0;
+      this.bailoutPositionSide = side;
+    }
+    const threshold = Number(this.config.mhtBailoutDfsThreshold) || 0.20;
+    const isAdverse = side === 'LONG' ? dfsP < threshold : dfsP > (1 - threshold);
+    if (isAdverse) {
+      this.bailoutAdverseTicks += 1;
+    } else {
+      this.bailoutAdverseTicks = 0;
+    }
+  }
+
+  private shouldBailoutMHT(input: StrategyInput): boolean {
+    if (!input.position) return false;
+    const windowMs = Number(this.config.mhtBailoutWindowMs) || 30_000;
+    const ageMs = this.getPositionAgeMs(input);
+    if (ageMs === null || ageMs > windowMs) return false; // only within first 30s
+    const requiredTicks = Number(this.config.mhtBailoutPersistTicks) || 5;
+    return this.bailoutAdverseTicks >= requiredTicks;
+  }
+
+  /**
+   * V13 Swing Mode: Only hard stop-loss active for swing positions.
+   * No time-stop, no exit-score, no soft reduce.
+   * Just structural stop-loss to protect capital.
+   */
+  private maybeSwingHardStop(input: StrategyInput): StrategyAction | null {
+    if (!input.position) return null;
+    const side = input.position.side;
+    const price = input.market.price;
+    const unrealizedPnlPct = input.position.unrealizedPnlPct ?? 0;
+
+    // Structural hard stop: 1.5% max loss
+    const HARD_STOP_PCT = -0.015;
+    const structuralStopPct = this.getStructuralStopPct(input, side);
+    const stopLossThreshold = structuralStopPct !== null
+      ? Math.min(structuralStopPct, HARD_STOP_PCT)
+      : HARD_STOP_PCT;
+
+    if (unrealizedPnlPct <= stopLossThreshold) {
+      return {
+        type: StrategyActionType.EXIT, side, reason: 'EXIT_STOP_LOSS', expectedPrice: price,
+        metadata: { unrealizedPnlPct, stopLossThreshold, structuralStop: structuralStopPct, mode: 'SWING_HARD_STOP' },
+      };
+    }
+
+    return null;
+  }
+
   private maybeHardExit(
     input: StrategyInput,
     dfsP: number,
@@ -946,66 +1300,81 @@ export class NewStrategyV11 {
 
     // ═══════════════════════════════════════════════════════════════
     // HARD STOP: Yapısal %1.5 stop — tek katman, kademeli stop yok
-    // Swing noktası / VAH-VAL arkasına yerleştirilir.
-    // Eğer structure varsa, structure anchor kullanılır.
     // ═══════════════════════════════════════════════════════════════
-    const HARD_STOP_PCT = -0.015; // %1.5 yapısal stop
+    const HARD_STOP_PCT = -0.015;
     const structuralStopPct = this.getStructuralStopPct(input, side);
     const stopLossThreshold = structuralStopPct !== null
-      ? Math.min(structuralStopPct, HARD_STOP_PCT) // whichever is tighter
+      ? Math.min(structuralStopPct, HARD_STOP_PCT)
       : HARD_STOP_PCT;
 
     if (unrealizedPnlPct <= stopLossThreshold) {
       return {
-        type: StrategyActionType.EXIT,
-        side,
-        reason: 'EXIT_STOP_LOSS',
-        expectedPrice: price,
-        metadata: {
-          unrealizedPnlPct,
-          stopLossThreshold,
-          structuralStop: structuralStopPct,
-          mode: 'STRUCTURAL_HARD_STOP',
-        },
+        type: StrategyActionType.EXIT, side, reason: 'EXIT_STOP_LOSS', expectedPrice: price,
+        metadata: { unrealizedPnlPct, stopLossThreshold, structuralStop: structuralStopPct, mode: 'STRUCTURAL_HARD_STOP' },
       };
     }
 
     // ═══════════════════════════════════════════════════════════════
-    // FLOW REVERSAL EXIT: Mikro yapı (order flow) tersine döndüğünde çık
-    // Bu, partial stop'lar ve breakeven stop'un yerini alır.
-    // Kârdayken akış tersine dönerse → pozisyonu kapat
+    // V12 EV SCALP EXIT: tighter stop (0.5%) + time limit (30s)
     // ═══════════════════════════════════════════════════════════════
-    const flowReversalExit = this.checkFlowReversalExit(input, dfsP, side);
-    if (flowReversalExit) {
-      return {
-        type: StrategyActionType.EXIT,
-        side,
-        reason: 'EXIT_FLOW_REVERSAL',
-        expectedPrice: price,
-        metadata: {
-          unrealizedPnlPct,
-          peakPnlPct: this.getPeakPnlPct(input),
-          dfsP,
-          cvdSlope: input.market.cvdSlope,
-          obiWeighted: input.market.obiWeighted,
-          mode: 'FLOW_REVERSAL',
-        },
-      };
-    }
-
-    // ═══════════════════════════════════════════════════════════════
-    // SEVERE OPPOSITE PRESSURE: Extreme karşı akış → acil çıkış
-    // ═══════════════════════════════════════════════════════════════
-    if (this.hasSevereOppositePressure(input, dfsP, thresholds)) {
-      const confirmedTrendExit = this.hasConfirmedTrendExitContext(input, side);
-      const bias15m = this.bias15m(input);
-      const veto1h = this.veto1h(input);
-      const trendAligned = this.isTrendAligned(side, bias15m, veto1h);
-      if (confirmedTrendExit || !trendAligned || unrealizedPnlPct <= 0) {
-        return { type: StrategyActionType.EXIT, side, reason: 'EXIT_HARD', expectedPrice: price,
-          metadata: { mode: 'SEVERE_PRESSURE', unrealizedPnlPct } };
+    if (this.isEvScalpPosition) {
+      const scalpStopPct = -(this.config.evScalpStopPct ?? 0.005);
+      if (unrealizedPnlPct <= scalpStopPct) {
+        return {
+          type: StrategyActionType.EXIT, side, reason: 'EXIT_STOP_LOSS', expectedPrice: price,
+          metadata: { unrealizedPnlPct, stopLossThreshold: scalpStopPct, mode: 'EV_SCALP_STOP' },
+        };
+      }
+      const scalpTimeLimit = this.config.evScalpMaxTimeLimitMs ?? 30_000;
+      const posAge = this.getPositionAgeMs(input);
+      if (posAge !== null && posAge >= scalpTimeLimit) {
+        return {
+          type: StrategyActionType.EXIT, side, reason: 'EXIT_TIME_STOP', expectedPrice: price,
+          metadata: { unrealizedPnlPct, posAgeMs: posAge, scalpTimeLimit, mode: 'EV_SCALP_TIME' },
+        };
       }
     }
+
+    // ═══════════════════════════════════════════════════════════════
+    // V12 MHT BAILOUT: fresh position override if DFS severely adverse
+    // ═══════════════════════════════════════════════════════════════
+    if (this.shouldBailoutMHT(input)) {
+      return {
+        type: StrategyActionType.EXIT, side, reason: 'EXIT_MHT_BAILOUT', expectedPrice: price,
+        metadata: { unrealizedPnlPct, bailoutTicks: this.bailoutAdverseTicks, mode: 'MHT_BAILOUT' },
+      };
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // V12 EXIT SCORE: unified weighted exit signal
+    // Replaces boolean-AND checkFlowReversalExit + hasSevereOppositePressure
+    // >= 0.75 → hard exit, >= 0.60 → soft reduce (50%)
+    // ═══════════════════════════════════════════════════════════════
+    const exitScore = this.computeExitScore(input, dfsP, side);
+    const hardThreshold = Number(this.config.exitScoreHardThreshold) || 0.75;
+    const softThreshold = Number(this.config.exitScoreSoftThreshold) || 0.60;
+
+    if (exitScore >= hardThreshold) {
+      return {
+        type: StrategyActionType.EXIT, side, reason: 'EXIT_SCORE_HARD', expectedPrice: price,
+        metadata: { unrealizedPnlPct, exitScore, threshold: hardThreshold, mode: 'EXIT_SCORE' },
+      };
+    }
+
+    if (exitScore >= softThreshold && unrealizedPnlPct > 0) {
+      // Soft reduce — protect profits when exit score is elevated but not critical
+      return {
+        type: StrategyActionType.REDUCE, side, reason: 'EXIT_SCORE_SOFT', reducePct: 0.5,
+        expectedPrice: price,
+        metadata: { unrealizedPnlPct, exitScore, threshold: softThreshold, mode: 'EXIT_SCORE_SOFT' },
+      };
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // V12 TIME-STOP: ATR-adaptive — exit if not in profit after 30-120s
+    // ═══════════════════════════════════════════════════════════════
+    const timeStopAction = this.checkTimeStop(input);
+    if (timeStopAction) return timeStopAction;
 
     // ═══════════════════════════════════════════════════════════════
     // CONTEXT BLOCKED: Execution blocked by manipulation/liquidity
@@ -1088,11 +1457,17 @@ export class NewStrategyV11 {
   ): boolean {
     if (!input.position) return false;
     if (!this.isFreshPosition(input, this.getFreshExitProtectMs())) return false;
+    // V12: bailout overrides fresh protection
+    if (this.shouldBailoutMHT(input)) return false;
     const unrealizedPnlPct = input.position.unrealizedPnlPct ?? 0;
     if (unrealizedPnlPct <= this.getFreshExitOverrideLossPct()) {
       return false;
     }
-    return !this.hasSevereOppositePressure(input, dfsP, thresholds);
+    // V12: Exit Score >= hard threshold also overrides fresh protection
+    const exitScore = this.computeExitScore(input, dfsP, input.position.side);
+    const hardThreshold = Number(this.config.exitScoreHardThreshold) || 0.75;
+    if (exitScore >= hardThreshold) return false;
+    return true;
   }
 
   private hasSevereOppositePressure(
@@ -2014,6 +2389,10 @@ export class NewStrategyV11 {
         contextEdgeScore: input.decisionContext?.edge.score ?? null,
         contextSpoofScore: input.decisionContext?.manipulation.spoofScore ?? null,
         contextSlippageBps: input.decisionContext?.liquidity.expectedSlippageBps ?? null,
+        trsTrendScore: this.lastTrsOutput?.components.trendScore ?? null,
+        trsCurrentTrend: this.lastTrsOutput?.currentTrend === 'LONG' ? 1 : this.lastTrsOutput?.currentTrend === 'SHORT' ? -1 : 0,
+        trsConfirmTicks: this.lastTrsOutput?.confirmTicks ?? null,
+        swingMode: this.swingPositionDirection === 'LONG' ? 1 : this.swingPositionDirection === 'SHORT' ? -1 : 0,
       },
       replayInput: INCLUDE_REPLAY_INPUT ? this.cloneReplayInput(input) : undefined,
     };

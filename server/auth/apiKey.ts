@@ -3,7 +3,7 @@ import { IncomingMessage } from 'http';
 import { NextFunction, Request, Response } from 'express';
 
 const API_KEY_SECRET = String(process.env.API_KEY_SECRET || '').trim();
-if (!API_KEY_SECRET) {
+if (!API_KEY_SECRET && String(process.env.DRY_RUN || 'true').toLowerCase() !== 'true') {
     throw new Error('[auth] Missing API_KEY_SECRET. Set it in server/.env before starting the backend.');
 }
 const READONLY_VIEW_TOKEN = String(process.env.READONLY_VIEW_TOKEN || process.env.PUBLIC_VIEW_TOKEN || '').trim();

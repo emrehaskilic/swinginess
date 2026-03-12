@@ -1,4 +1,4 @@
-import { NormalizationStore } from './Normalization';
+import { NormalizationStore, DualNormalizationStore } from './Normalization';
 
 const EPS = 1e-12;
 
@@ -19,6 +19,11 @@ export interface DirectionalFlowInput {
   prevPrice: number | null;
   prevCvd: number | null;
   nowMs: number;
+  // V12: OI Dynamic Weight — regime hint + OI data freshness
+  regime?: 'TR' | 'MR' | 'EV';
+  oiLastUpdatedMs?: number;
+  oiDynamicWeightMR?: number;  // target w8 in MR regime (default 0.20)
+  oiStalenessMaxMs?: number;   // max age for OI data to be considered fresh (default 10_000)
 }
 
 export interface DirectionalFlowOutput {
@@ -63,6 +68,7 @@ interface ComponentPerformanceRecord {
 
 export class DirectionalFlowScore {
   private readonly norm: NormalizationStore;
+  private readonly dualNorm: DualNormalizationStore | null;
   private readonly weights: DirectionalFlowWeights;
 
   // Adaptive weight learning rate (EMA alpha)
@@ -80,8 +86,9 @@ export class DirectionalFlowScore {
   // Last computed components (preserved for post-trade feedback)
   private lastComponents: Record<string, number> = {};
 
-  constructor(norm: NormalizationStore, weights?: Partial<DirectionalFlowWeights>) {
+  constructor(norm: NormalizationStore, weights?: Partial<DirectionalFlowWeights>, dualNorm?: DualNormalizationStore) {
     this.norm = norm;
+    this.dualNorm = dualNorm ?? null;
     this.weights = { ...DEFAULT_WEIGHTS, ...(weights || {}) };
   }
 
@@ -160,6 +167,7 @@ export class DirectionalFlowScore {
     const pressure = input.aggressiveBuyVolume / (input.aggressiveSellVolume + EPS);
     const logP = Math.log(Math.max(EPS, pressure));
 
+    // Always feed the legacy single-window store (backward compat + RegimeSelector uses it)
     this.norm.update('deltaZ', input.deltaZ, input.nowMs);
     this.norm.update('cvdSlope', input.cvdSlope, input.nowMs);
     this.norm.update('logP', logP, input.nowMs);
@@ -169,35 +177,70 @@ export class DirectionalFlowScore {
     this.norm.update('burstCount', input.burstCount, input.nowMs);
     this.norm.update('oiChangePct', input.oiChangePct, input.nowMs);
 
-    const zDelta = input.deltaZ;
-    const zCvd = this.norm.zScore('cvdSlope', input.cvdSlope);
-    const zLogP = this.norm.zScore('logP', logP);
-    const zObiW = this.norm.zScore('obiWeighted', input.obiWeighted);
-    const zObiD = this.norm.zScore('obiDeep', input.obiDeep);
+    // V12: Feed dual normalization store (micro + macro) when available
+    if (this.dualNorm) {
+      this.dualNorm.update('deltaZ', input.deltaZ, input.nowMs);
+      this.dualNorm.update('cvdSlope', input.cvdSlope, input.nowMs);
+      this.dualNorm.update('logP', logP, input.nowMs);
+      this.dualNorm.update('obiWeighted', input.obiWeighted, input.nowMs);
+      this.dualNorm.update('obiDeep', input.obiDeep, input.nowMs);
+      this.dualNorm.update('sweepStrength', Math.abs(input.sweepStrength), input.nowMs);
+      this.dualNorm.update('burstCount', input.burstCount, input.nowMs);
+      this.dualNorm.update('oiChangePct', input.oiChangePct, input.nowMs);
+    }
 
-    const sweepP = this.norm.percentile('sweepStrength', Math.abs(input.sweepStrength));
+    // V12: Use micro z-scores for entry-signal components (responsive, 5min window)
+    // Fall back to legacy single-window store when dual is not available
+    const microNorm = this.dualNorm?.micro ?? this.norm;
+    const macroNorm = this.dualNorm?.macro ?? this.norm;
+
+    const zDelta = input.deltaZ;
+    const zCvd = microNorm.zScore('cvdSlope', input.cvdSlope);
+    const zLogP = microNorm.zScore('logP', logP);
+    const zObiW = microNorm.zScore('obiWeighted', input.obiWeighted);
+    const zObiD = microNorm.zScore('obiDeep', input.obiDeep);
+
+    const sweepP = microNorm.percentile('sweepStrength', Math.abs(input.sweepStrength));
     const sweepSigned = Math.sign(input.sweepStrength || 0) * sweepP;
 
-    const burstP = this.norm.percentile('burstCount', input.burstCount);
+    const burstP = microNorm.percentile('burstCount', input.burstCount);
     const burstSigned = (input.burstSide === 'buy' ? 1 : input.burstSide === 'sell' ? -1 : 0) * burstP;
 
     const priceChange = input.prevPrice !== null ? input.price - input.prevPrice : 0;
     const cvdChange = input.prevCvd !== null ? input.cvdSlope - input.prevCvd : 0;
-    const oiZ = this.norm.zScore('oiChangePct', input.oiChangePct);
+    const oiZ = microNorm.zScore('oiChangePct', input.oiChangePct);
     const oiImpulse = Math.sign(priceChange || 0) * Math.sign(cvdChange || 0) * oiZ;
 
-    const dfs =
-      (this.weights.w1 * zDelta) +
-      (this.weights.w2 * zCvd) +
-      (this.weights.w3 * zLogP) +
-      (this.weights.w4 * zObiW) +
-      (this.weights.w5 * zObiD) +
-      (this.weights.w6 * sweepSigned) +
-      (this.weights.w7 * burstSigned) +
-      (this.weights.w8 * oiImpulse);
+    // V12: OI Dynamic Weight — boost w8 in MR regime when OI data is fresh
+    let effectiveW8 = this.weights.w8;
+    if (input.regime === 'MR' && input.oiLastUpdatedMs != null) {
+      const oiAge = input.nowMs - input.oiLastUpdatedMs;
+      const maxStale = input.oiStalenessMaxMs ?? 10_000;
+      if (oiAge < maxStale && Math.abs(input.oiChangePct) > 0) {
+        effectiveW8 = input.oiDynamicWeightMR ?? 0.20;
+      }
+    }
 
+    // Re-normalize weights on the fly when w8 is boosted
+    const w8Delta = effectiveW8 - this.weights.w8;
+    const scale = w8Delta !== 0 ? (1 - effectiveW8) / (1 - this.weights.w8 + EPS) : 1;
+
+    const dfs =
+      (this.weights.w1 * scale * zDelta) +
+      (this.weights.w2 * scale * zCvd) +
+      (this.weights.w3 * scale * zLogP) +
+      (this.weights.w4 * scale * zObiW) +
+      (this.weights.w5 * scale * zObiD) +
+      (this.weights.w6 * scale * sweepSigned) +
+      (this.weights.w7 * scale * burstSigned) +
+      (effectiveW8 * oiImpulse);
+
+    // V12: DFS percentile uses macro window (stable, 60min) for trend detection
     this.norm.update('dfs', dfs, input.nowMs);
-    const dfsPercentile = this.norm.percentile('dfs', dfs);
+    if (this.dualNorm) {
+      this.dualNorm.update('dfs', dfs, input.nowMs);
+    }
+    const dfsPercentile = macroNorm.percentile('dfs', dfs);
 
     const components = {
       zDelta,

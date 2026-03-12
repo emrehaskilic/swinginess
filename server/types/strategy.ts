@@ -62,6 +62,14 @@ export type DecisionReason =
   | 'ENTRY_EXHAUSTION_FADE'
   | 'ENTRY_TREND_PULLBACK'
   | 'EXIT_FLOW_REVERSAL'
+  | 'EXIT_SCORE_HARD'
+  | 'EXIT_SCORE_SOFT'
+  | 'EXIT_MHT_BAILOUT'
+  | 'EXIT_TIME_STOP'
+  | 'ENTRY_EV_SCALP'
+  | 'ENTRY_SWING_REVERSAL'
+  | 'EXIT_SWING_REVERSAL'
+  | 'WARMUP_GUARD'
   | 'NO_SIGNAL'
   | 'NOOP';
 
@@ -400,6 +408,40 @@ export interface StrategyConfig {
   atrStopMin?: number;
   atrStopMax?: number;
   targetVolPct?: number;
+  // V12 — Exit Score
+  exitScoreHardThreshold?: number;
+  exitScoreSoftThreshold?: number;
+  // V12 — MHT Bailout
+  mhtBailoutDfsThreshold?: number;
+  mhtBailoutPersistTicks?: number;
+  mhtBailoutWindowMs?: number;
+  // V12 — Time-Stop
+  timeStopEnabled?: boolean;
+  timeStopBaseMs?: number;
+  timeStopMinMs?: number;
+  timeStopMaxMs?: number;
+  // V12 — EV Scalp
+  evScalpEnabled?: boolean;
+  evScalpSizeMultiplier?: number;
+  evScalpStopPct?: number;
+  evScalpMaxTimeLimitMs?: number;
+  evScalpDailyMaxTrades?: number;
+  evScalpMinVwapDistPct?: number;
+  // V12 — OI Dynamic Weight
+  oiDynamicWeightEnabled?: boolean;
+  oiDynamicWeightMR?: number;
+  oiStalenessMaxMs?: number;
+  // V13 — Swing Trading Mode
+  swingModeEnabled?: boolean;
+  warmupMinSamples?: number;
+  trsReversalThreshold?: number;
+  trsConfirmTicks?: number;
+  trsEmaFastAlpha?: number;
+  trsEmaSlowAlpha?: number;
+  swingHoldDisableTimeStop?: boolean;
+  swingHoldDisableExitScore?: boolean;
+  swingHoldDisableSoftReduce?: boolean;
+  swingMinHoldMs?: number;
 }
 
 export const defaultStrategyConfig: StrategyConfig = {
@@ -423,7 +465,7 @@ export const defaultStrategyConfig: StrategyConfig = {
   hardRevRequireAbsorption: String(process.env.HARDREV_REQUIRE_ABSORPTION || 'true').toLowerCase() === 'true',
   defensiveAddEnabled: String(process.env.DEFENSIVE_ADD_ENABLED || 'false').toLowerCase() === 'true',
   dryRun: String(process.env.DRY_RUN || 'true').toLowerCase() === 'true',
-  addSizing: [1.0, 0.6, 0.4],
+  addSizing: [1.0, 0.3, 0.2],
   maxLossPct: Number(process.env.STRATEGY_MAX_LOSS_PCT || -0.012),
   hardRevSizeMultiplier: Number(process.env.HARDREV_SIZE_MULTIPLIER || 0.5),
   mrRequireAbsorption: String(process.env.MR_REQUIRE_ABSORPTION || 'true').toLowerCase() === 'true',

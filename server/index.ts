@@ -2559,8 +2559,13 @@ async function processSymbolEvent(s: string, d: any) {
             doneAtMs: Number.isFinite(Number(strategyBootstrapState.doneAtMs)) ? Number(strategyBootstrapState.doneAtMs) : null,
         };
 
+        // V12: Urgent Evaluate — bypass throttle on large trades (> $50K notional)
+        const URGENT_EVALUATE_NOTIONAL_USD = 50_000;
+        const tradeNotionalUsd = p * q;
+        const isUrgentTrade = tradeNotionalUsd >= URGENT_EVALUATE_NOTIONAL_USD;
+
         const shouldEvaluateStrategy = decisionFlowEnabled
-            && (!decision || (now - meta.lastStrategyEvalTs) >= STRATEGY_EVAL_MIN_INTERVAL_MS);
+            && (!decision || (now - meta.lastStrategyEvalTs) >= STRATEGY_EVAL_MIN_INTERVAL_MS || isUrgentTrade);
         // Hoist so we can reuse in broadcast without a second getMetrics() call
         let advancedBundleForDecision: AdvancedMicrostructureBundle | null = null;
         if (shouldEvaluateStrategy) {
