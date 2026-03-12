@@ -414,7 +414,7 @@ export class NewStrategyV11 {
       ? 'ENTRY_EXHAUSTION_FADE'
       : setupKind === 'TREND_PULLBACK_RELOAD'
         ? 'ENTRY_TREND_PULLBACK'
-        : regime === 'EV' ? 'ENTRY_EV' : regime === 'MR' ? 'ENTRY_MR' : 'ENTRY_TR';
+        : regime === 'MR' ? 'ENTRY_MR' : 'ENTRY_TR';
     return {
       type: StrategyActionType.ENTRY,
       side: desiredSide,
